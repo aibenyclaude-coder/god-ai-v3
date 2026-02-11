@@ -2,6 +2,7 @@
 """God AI v3.0 — 1ファイルから始まる自律型AI"""
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -26,6 +27,7 @@ STATE_PATH = MEMORY_DIR / "state.json"
 JOURNAL_PATH = MEMORY_DIR / "journal.md"
 BENY_PATH = MEMORY_DIR / "beny.md"
 CONVERSATIONS_PATH = MEMORY_DIR / "conversations.json"
+CONVERSATIONS_ARCHIVE_PATH = MEMORY_DIR / "conversations_archive.json"
 GOD_PY_PATH = CORE_DIR / "god.py"
 
 # ─── ログ設定 ───
@@ -89,7 +91,40 @@ def load_conversations() -> list:
             pass
     return []
 
+def load_conversations_archive() -> list:
+    if CONVERSATIONS_ARCHIVE_PATH.exists():
+        try:
+            return json.loads(CONVERSATIONS_ARCHIVE_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, FileNotFoundError):
+            pass
+    return []
+
+def save_conversations_archive(archive: list):
+    CONVERSATIONS_ARCHIVE_PATH.write_text(json.dumps(archive, ensure_ascii=False, indent=2), encoding="utf-8")
+
 def save_conversations(convos: list):
+    # 重要な会話を判定してアーカイブに保存
+    archive = load_conversations_archive()
+    important_keywords = ["エラー", "失敗", "重要", "バグ", "修正", "致命的", "警告", "問題"]
+    
+    for conv in convos:
+        text_lower = conv.get("text", "").lower()
+        if any(kw in text_lower for kw in important_keywords):
+            # 既にアーカイブにあるか確認（重複防止）
+            if not any(a.get("time") == conv.get("time") and a.get("text") == conv.get("text") for a in archive):
+                archive.append({
+                    "time": conv.get("time"),
+                    "from": conv.get("from"),
+                    "text": conv.get("text"),
+                    "importance": "high",
+                    "archived_at": datetime.now(timezone.utc).isoformat()
+                })
+    
+    # アーカイブは最新500件まで保持
+    if len(archive) > 500:
+        archive = archive[-500:]
+    save_conversations_archive(archive)
+    
     # 最新50件のみ保持
     convos = convos[-50:]
     CONVERSATIONS_PATH.write_text(json.dumps(convos, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -104,7 +139,11 @@ _write_lock: asyncio.Lock | None = None
 def get_write_lock() -> asyncio.Lock:
     global _write_lock
     if _write_lock is None:
-        _write_lock = asyncio.Lock()
+        try:
+            _write_lock = asyncio.Lock()
+        except RuntimeError:
+            loop = asyncio.get_running_loop()
+            _write_lock = asyncio.Lock()
     return _write_lock
 
 async def safe_save_state(state: dict):
@@ -173,9 +212,9 @@ async def think_gemini(prompt: str) -> tuple[str, str]:
         text, _ = await think_claude(prompt)
         return (text, "Claude CLI (fallback)")
 
-# ─── 脳: Claude CLI ───
+# ─── 脳: Claude CLI（リトライメカニズム強化版）───
 async def think_claude(prompt: str) -> tuple[str, str]:
-    """Claude CLIで思考（会話用、タイムアウト120秒）。戻り値: (テキスト, 脳の名前)"""
+    """Claude CLIで思考（会話用、タイムアウト120秒、リトライ強化）。戻り値: (テキスト, 脳の名前)"""
     global claude_count
     loop = asyncio.get_running_loop()
     for attempt in range(3):
@@ -200,7 +239,7 @@ async def think_claude(prompt: str) -> tuple[str, str]:
     raise RuntimeError("Claude CLI failed after 3 attempts (timeout=120s)")
 
 async def think_claude_heavy(prompt: str) -> tuple[str, str]:
-    """Claude CLIで重い処理（自己改善用、タイムアウト280秒=実測185秒×1.5）。戻り値: (テキスト, 脳の名前)"""
+    """Claude CLIで重い処理（自己改善用、タイムアウト280秒、リトライ強化）。戻り値: (テキスト, 脳の名前)"""
     global claude_count
     loop = asyncio.get_running_loop()
     for attempt in range(3):
@@ -284,11 +323,81 @@ def format_status(state: dict) -> str:
         f"Claude使用: {claude_count}回"
     )
 
+# ─── コード構文検証関数（強化版）───
+def validate_code_syntax(code: str) -> tuple[bool, str]:
+    """生成コードの構文を厳密に検証。戻り値: (有効かどうか, エラーメッセージ)"""
+    try:
+        ast.parse(code)
+        return (True, "")
+    except SyntaxError as e:
+        error_msg = f"SyntaxError at line {e.lineno}, col {e.offset}: {e.msg}"
+        if e.lineno:
+            lines = code.splitlines()
+            start = max(0, e.lineno - 3)
+            end = min(len(lines), e.lineno + 2)
+            context = "\n".join([f"{i+1}: {lines[i]}" for i in range(start, end)])
+            error_msg += f"\n周辺コード:\n{context}"
+        return (False, error_msg)
+    except Exception as e:
+        return (False, f"Unexpected error: {e}")
+
+# ─── journal解析: 重複改善提案チェック ───
+def check_duplicate_improvements(journal_text: str, improvement_text: str) -> bool:
+    """直近3回のjournal振り返り履歴から、同一のCODE_IMPROVEMENT提案があるかチェック。
+    戻り値: True = 重複あり（スキップすべき）, False = 重複なし（実行すべき）"""
+    lines = journal_text.splitlines()
+    reflections = []
+    current_reflection = []
+    
+    for line in lines:
+        if line.startswith("###") and "振り返り" in line:
+            if current_reflection:
+                reflections.append("\n".join(current_reflection))
+            current_reflection = [line]
+        elif current_reflection:
+            current_reflection.append(line)
+    
+    if current_reflection:
+        reflections.append("\n".join(current_reflection))
+    
+    # 直近3回の振り返りから CODE_IMPROVEMENT を抽出
+    recent_improvements = []
+    for refl in reflections[-3:]:
+        for line in refl.splitlines():
+            if "CODE_IMPROVEMENT:" in line:
+                improvement = line.split("CODE_IMPROVEMENT:", 1)[1].strip()
+                recent_improvements.append(improvement)
+    
+    # 類似度チェック（簡易版: 50%以上の単語が一致したら重複と判定）
+    improvement_words = set(improvement_text.lower().split())
+    for past_imp in recent_improvements:
+        past_words = set(past_imp.lower().split())
+        if len(improvement_words & past_words) / max(len(improvement_words), 1) > 0.5:
+            return True
+    
+    return False
+
+# ─── 振り返り排他制御 ───
+_reflecting = False
+
 # ─── 振り返りサイクル ───
-async def reflection_cycle(client: httpx.AsyncClient):
+async def reflection_cycle(client: httpx.AsyncClient) -> bool:
+    """振り返り実行。戻り値: 実行したかどうか"""
+    global _reflecting
+    if _reflecting:
+        log.warning("振り返り中のため新しい振り返り要求を無視")
+        return False
+    _reflecting = True
+    try:
+        await _reflection_cycle_inner(client)
+        return True
+    finally:
+        _reflecting = False
+
+async def _reflection_cycle_inner(client: httpx.AsyncClient):
     log.info("振り返りサイクル開始")
     state = load_state()
-    journal_tail = read_file(JOURNAL_PATH, tail=30)
+    journal_tail = read_file(JOURNAL_PATH, tail=50)
 
     prompt = f"""あなたはGod AI。自律型AIとして振り返りを行え。
 
@@ -326,13 +435,28 @@ async def reflection_cycle(client: httpx.AsyncClient):
 
     # コード改善提案チェック
     if "CODE_IMPROVEMENT:" in reflection:
-        await self_improve(client, reflection)
+        # 重複チェック
+        improvements = []
+        for line in reflection.splitlines():
+            if line.strip().startswith("CODE_IMPROVEMENT:"):
+                improvements.append(line.strip().replace("CODE_IMPROVEMENT:", "").strip())
+        
+        if improvements:
+            improvement_text = "\n".join(improvements)
+            journal_full = read_file(JOURNAL_PATH)
+            
+            if check_duplicate_improvements(journal_full, improvement_text):
+                log.info("重複した改善提案を検出。自己改善をスキップします。")
+                skip_msg = f"### {now} 自己改善スキップ（重複検出）\n改善内容: {improvement_text}"
+                await safe_append_journal(skip_msg)
+                await tg_send(client, f"⚠️ 重複した改善提案を検出。既に適用済みの可能性が高いためスキップしました。\n提案: {improvement_text[:200]}")
+            else:
+                await self_improve(client, reflection)
 
     log.info("振り返りサイクル完了")
 
 async def self_improve(client: httpx.AsyncClient, reflection: str):
-    """コード自己改善（最大3回リトライ）"""
-    import ast
+    """コード自己改善（構文チェック強化、最大3回リトライ）"""
     import difflib
 
     log.info("自己改善プロセス開始")
@@ -372,6 +496,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 "- コードの先頭は #!/usr/bin/env python3 から始めてください\n"
                 "- 変更箇所以外は絶対にそのまま維持してください\n"
                 "- 文字列リテラルのクォートの対応に注意してください\n"
+                "- 特に、複数行文字列リテラル（'''または\"\"\"）と通常の文字列リテラル（'または\"）が混在する場合、クォートの整合性を厳密に確認してください\n"
                 "- 改善内容に基づいて必要な変更を適切に実装してください\n"
                 "- コードの長さは元のコードとほぼ同じか、改善によって多少増減する程度に保ってください\n\n"
                 f"【改善内容】\n{improvement_text}\n\n"
@@ -388,6 +513,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 "- コードの先頭は #!/usr/bin/env python3 から始めてください\n"
                 "- 変更箇所以外は絶対にそのまま維持してください\n"
                 "- 文字列リテラルのクォートの対応に特に注意してください\n"
+                "- 特に、複数行文字列リテラル（'''または\"\"\"）と通常の文字列リテラル（'または\"）が混在する場合、クォートの整合性を厳密に確認してください\n"
                 "- 前回のエラーを踏まえて慎重に修正してください\n"
                 "- 改善内容に基づいて必要な変更を適切に実装してください\n"
                 "- コードの長さは元のコードとほぼ同じか、改善によって多少増減する程度に保ってください\n\n"
@@ -434,20 +560,11 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 log.error(f"試行{attempt}: 差分（先頭50行）:\n{diff_str}")
                 raise ValueError(f"生成コードが短すぎる（元: {len(current_code)}字, 生成: {len(code)}字, 最小: {min_length}字）")
 
-            # 構文チェック
-            try:
-                ast.parse(code)
-            except SyntaxError as se:
-                # デバッグログ: 構文エラーの詳細
-                log.error(f"試行{attempt}: 構文エラー詳細: {se}")
-                log.error(f"試行{attempt}: エラー行番号: {se.lineno}, カラム: {se.offset}")
-                if se.lineno:
-                    error_lines = code.splitlines()
-                    start = max(0, se.lineno - 3)
-                    end = min(len(error_lines), se.lineno + 2)
-                    context = "\n".join([f"{i+1}: {error_lines[i]}" for i in range(start, end)])
-                    log.error(f"試行{attempt}: エラー周辺コード:\n{context}")
-                raise
+            # 構文チェック（強化版）
+            is_valid, syntax_error_msg = validate_code_syntax(code)
+            if not is_valid:
+                log.error(f"試行{attempt}: 構文エラー: {syntax_error_msg}")
+                raise SyntaxError(syntax_error_msg)
 
             # 差分ログ出力
             new_lines = code.splitlines()
@@ -553,9 +670,15 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
 
                 # /reflect コマンド
                 if text.strip() == "/reflect":
-                    await tg_send(client, "🔄 振り返り開始...")
-                    await reflection_cycle(client)
-                    await tg_send(client, "✅ 振り返り完了。journalを更新しました。")
+                    if _reflecting:
+                        await tg_send(client, "⏳ 振り返り中です。しばらくお待ちください。")
+                    else:
+                        await tg_send(client, "🔄 振り返り開始...")
+                        executed = await reflection_cycle(client)
+                        if executed:
+                            await tg_send(client, "✅ 振り返り完了。journalを更新しました。")
+                        else:
+                            await tg_send(client, "⏳ 振り返り中のため、実行をスキップしました。")
                     continue
 
                 # 通常メッセージ: ⏳送信 → think → 上書き
@@ -604,10 +727,16 @@ async def reflection_scheduler(client: httpx.AsyncClient):
         try:
             await asyncio.sleep(REFLECTION_INTERVAL)
             log.info("定期振り返り: 開始")
+            if _reflecting:
+                log.warning("定期振り返り: 手動振り返り中のためスキップ")
+                continue
             await tg_send(client, f"🔄 定期振り返り開始... (次回: {REFLECTION_INTERVAL}秒後)")
-            await reflection_cycle(client)
-            await tg_send(client, "✅ 定期振り返り完了。journalを更新しました。")
-            log.info("定期振り返り: 完了")
+            executed = await reflection_cycle(client)
+            if executed:
+                await tg_send(client, "✅ 定期振り返り完了。journalを更新しました。")
+                log.info("定期振り返り: 完了")
+            else:
+                log.warning("定期振り返り: 他の振り返りと競合のためスキップ")
         except asyncio.CancelledError:
             log.info("振り返りスケジューラ: キャンセルされました")
             raise
