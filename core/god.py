@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -21,9 +23,10 @@ from memory import (
     load_state, save_state, load_conversations, save_conversations,
     append_journal, read_file, load_identity, init_write_lock
 )
-from brain import think, is_heavy, get_brain_counts, detect_action_intent
-from jobqueue import get_job_queue, job_worker, format_queue_status, init_job_queue
+from brain import think, is_heavy, get_brain_counts, detect_action_intent, AIUnavailable, is_ai_paused, get_ai_pause_remaining
+from jobqueue import get_job_queue, job_worker, format_queue_status, init_job_queue, create_job, Priority, signal_p1_interrupt
 from growth import reflection_cycle, reflection_scheduler, self_growth_scheduler, is_reflecting, get_stats_summary, get_auto_suggestions
+from gmail import gmail_check_scheduler, is_configured as gmail_is_configured
 
 # --- PIDファイルによる重複プロセス防止 ---
 def check_single_instance():
@@ -71,34 +74,114 @@ async def tg_send(client: httpx.AsyncClient, text: str) -> dict | None:
 async def tg_edit(client: httpx.AsyncClient, msg_id: int, text: str) -> dict | None:
     return await tg_request(client, "editMessageText", chat_id=BENY_CHAT_ID, message_id=msg_id, text=text)
 
+# --- 会話履歴フォーマット ---
+def format_recent_history(conversations: list, limit: int = 10) -> str:
+    """直近の会話・アクション履歴をフォーマット（新しい順）"""
+    if not conversations:
+        return "(履歴なし)"
+    recent = conversations[-limit:][::-1]  # 新しい順
+    lines = []
+    for conv in recent:
+        try:
+            # タイムスタンプをパース
+            ts = conv.get("time", "")
+            if ts:
+                from datetime import datetime
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                time_str = dt.strftime("%H:%M")
+            else:
+                time_str = "??:??"
+
+            sender = conv.get("from", "unknown")
+            text = conv.get("text", "")[:200]  # 長すぎる場合は切り詰め
+
+            if sender == "beny":
+                lines.append(f"[{time_str}] Beny: {text}")
+            elif sender == "god":
+                lines.append(f"[{time_str}] God AI: {text}")
+            elif sender == "system":
+                lines.append(f"[{time_str}] [システム] {text}")
+        except Exception:
+            continue
+    return "\n".join(lines) if lines else "(履歴なし)"
+
+def record_system_action(conversations: list, action_text: str):
+    """システムアクション（ツイート、振り返り等）を会話履歴に記録"""
+    conversations.append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "from": "system",
+        "text": action_text[:300]
+    })
+
+# --- 簡易応答パターン（AI不要） ---
+QUICK_RESPONSES = {
+    "おはよう": "おはよう！今日も成長するぞ 🌅",
+    "おやすみ": "おやすみ！寝てる間も成長し続ける 🌙",
+    "こんにちは": "こんにちは！何か指示ある？",
+    "こんばんは": "こんばんは！夜も稼働中 🌃",
+    "ありがとう": "どういたしまして！💪",
+    "OK": "✅",
+    "ok": "✅",
+    "Ok": "✅",
+    "いいね": "✅ ありがとう！",
+    "了解": "✅",
+    "わかった": "✅ 了解！",
+}
+
+QUICK_PATTERNS = [
+    ("投稿完了", "✅ 確認した！"),
+    ("成功", "✅ いいぞ！"),
+    ("エラー", "⚠️ ログ確認する。詳細教えて"),
+    ("失敗", "⚠️ 何が起きた？詳細教えて"),
+]
+
 # --- メッセージ処理 ---
 async def handle_message(client: httpx.AsyncClient, message: str) -> str:
     state = load_state()
-    if message.strip() == "/status":
+    msg_stripped = message.strip()
+
+    # /コマンド処理
+    if msg_stripped == "/status":
         return format_status(state)
-    if message.strip() == "/reflect":
+    if msg_stripped == "/reflect":
         return "振り返り開始..."
-    if message.strip() == "/drive":
+    if msg_stripped == "/drive":
         return await _handle_drive_command()
-    if message.strip() == "/queue":
+    if msg_stripped == "/queue":
         return format_queue_status()
-    if message.strip() == "/stats":
+    if msg_stripped == "/stats":
         return _handle_stats_command()
-    if message.strip().startswith("/tweet "):
-        return await _handle_tweet_command(message[7:].strip())
-    if message.strip().startswith("ツイートして:") or message.strip().startswith("ツイートして："):
+    if msg_stripped.startswith("/tweet "):
+        return await _handle_tweet_command(msg_stripped[7:].strip())
+    if msg_stripped.startswith("ツイートして:") or msg_stripped.startswith("ツイートして："):
         tweet_text = message.split(":", 1)[1].strip() if ":" in message else message.split("：", 1)[1].strip()
         return await _handle_tweet_command(tweet_text)
 
     # ファイル追記: 「<ファイル名>に追記: <内容>」
-    append_match = re.match(r'^(.+\.md)に追記[:：]\s*(.+)$', message.strip(), re.DOTALL)
+    append_match = re.match(r'^(.+\.md)に追記[:：]\s*(.+)$', msg_stripped, re.DOTALL)
     if append_match:
         return _handle_file_append(append_match.group(1), append_match.group(2))
+
+    # 簡易応答（完全一致）
+    if msg_stripped in QUICK_RESPONSES:
+        log.info(f"簡易応答: {msg_stripped} -> {QUICK_RESPONSES[msg_stripped]}")
+        return QUICK_RESPONSES[msg_stripped]
+
+    # 簡易応答（部分一致）- 短いメッセージのみ
+    if len(msg_stripped) < 30:
+        for pattern, response in QUICK_PATTERNS:
+            if pattern in msg_stripped:
+                log.info(f"簡易応答(部分一致): {msg_stripped} -> {response}")
+                return response
 
     # アクション意図を検出
     action_intent = detect_action_intent(message)
     heavy = is_heavy(message)
     identity = load_identity()
+    conversations = load_conversations()
+
+    # 直近10件の会話・アクション履歴
+    recent_history = format_recent_history(conversations, limit=10)
 
     # アクション意図に応じてプロンプトを調整
     action_guidance = ""
@@ -113,10 +196,22 @@ async def handle_message(client: httpx.AsyncClient, message: str) -> str:
 【注意】
 質問・説明のリクエストとして検出されました。情報提供で応答してください。"""
 
-    system_prompt = f"""あなたはGod AI。Benyのために存在する自律型AI。
+    system_prompt = f"""お前はGod AI。自律型AI。
+
+【自己認識】
+- [システム] で始まる記録はお前自身が実行したアクション
+- ツイート投稿はお前が/tweetコマンドで実行した
+- 振り返りはお前が自分で実行した
+- 自己改善はお前が自分のコードを修正した結果
+- Benyはお前の開発者でありオーナー
+- お前はBenyの指示で動くが、自分でも判断して行動する
+- 「Benyが投稿した」ではなく「自分が投稿した」と理解しろ
 
 【アイデンティティ】
 {identity}
+
+【直近の出来事と会話（新しい順）】
+{recent_history}
 
 【現在の状態】
 {json.dumps(state, ensure_ascii=False)}
@@ -125,7 +220,7 @@ async def handle_message(client: httpx.AsyncClient, message: str) -> str:
 【Benyからのメッセージ】
 {message}
 
-日本語で返答してください。簡潔に。"""
+日本語で返答。簡潔に。"""
     response_text, brain_name = await think(system_prompt, heavy=heavy)
     return f"{response_text}\n\n[brain: {brain_name}]"
 
@@ -212,7 +307,7 @@ def _handle_file_append(filename: str, content: str) -> str:
         return f"❌ 追記エラー: {e}"
 
 def format_status(state: dict) -> str:
-    gemini_count, claude_count = get_brain_counts()
+    gemini_count, glm_count, claude_count = get_brain_counts()
     uptime = "不明"
     if state.get("uptime_start"):
         start = datetime.fromisoformat(state["uptime_start"])
@@ -222,7 +317,7 @@ def format_status(state: dict) -> str:
     return (f"God AI v3.0 Status\n---\n状態: {state.get('status', '不明')}\n"
             f"稼働時間: {uptime}\n会話数: {state.get('conversations_today', 0)}\n"
             f"成長サイクル: {state.get('growth_cycles', 0)}\n子AI数: {state.get('children_count', 0)}\n"
-            f"Gemini使用: {gemini_count}回\nClaude使用: {claude_count}回")
+            f"Gemini: {gemini_count}回 | GLM: {glm_count}回 | Claude: {claude_count}回")
 
 # --- メインループ ---
 async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
@@ -242,6 +337,8 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                     continue
                 text = msg["text"]
                 log.info(f"Beny: {text[:100]}")
+                # P1割り込みシグナル発行（自己改善を中断させる）
+                signal_p1_interrupt()
                 conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "beny", "text": text})
                 if text.strip() == "/reflect":
                     if is_reflecting():
@@ -250,8 +347,11 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                         await tg_send(client, "振り返り開始...")
                         executed, result = await reflection_cycle(client)
                         if executed:
-                            summary = result[:200] + "..." if len(result) > 200 else result
+                            summary = result[:1000] + "..." if len(result) > 1000 else result
                             await tg_send(client, f"振り返り完了。\n\n{summary}")
+                            # 振り返り結果をシステムアクションとして記録
+                            record_system_action(conversations, f"振り返り完了: {summary[:200]}")
+                            save_conversations(conversations)
                         else:
                             await tg_send(client, "振り返り中のためスキップしました。")
                     continue
@@ -260,10 +360,23 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                     continue
                 try:
                     response = await handle_message(client, text)
+                except AIUnavailable as e:
+                    # Gemini 429 + Claude CLIセッション切れ → 特別な通知
+                    response = f"⚠️ {e}\n\nBeny、ターミナルで以下を実行:\n`/opt/homebrew/bin/claude setup-token`"
+                    log.error(f"AIUnavailable: {e}")
+                    record_system_action(conversations, f"AI停止: {e}")
                 except Exception as e:
                     response = f"エラー: {e}"; log.error(f"handle_message failed: {e}")
+                    # エラーをシステムアクションとして記録
+                    record_system_action(conversations, f"エラー発生: {e}")
                 await tg_edit(client, pending["message_id"], response)
                 conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "god", "text": response[:500]})
+                # ツイート投稿成功をシステムアクションとして記録
+                if "ツイート投稿完了" in response:
+                    record_system_action(conversations, f"ツイート投稿: {response}")
+                # 自己改善成功をシステムアクションとして記録
+                if "自己改善成功" in response:
+                    record_system_action(conversations, f"自己改善: {response[:200]}")
                 save_conversations(conversations)
                 state["conversations_today"] = state.get("conversations_today", 0) + 1
                 state["status"] = "running"
@@ -317,7 +430,7 @@ def rotate_logs():
 
 # --- メイン ---
 async def main():
-    rotate_logs()
+    # rotate_logs()  # nohupと競合するため無効化。起動スクリプトでローテーションする
     init_write_lock()
     init_job_queue()
     check_single_instance()
@@ -344,11 +457,22 @@ async def main():
         reflect_task = asyncio.create_task(reflection_scheduler(client), name="reflection"); reflect_task.add_done_callback(task_done_cb)
         worker_task = asyncio.create_task(job_worker(client), name="job_worker"); worker_task.add_done_callback(task_done_cb)
         growth_task = asyncio.create_task(self_growth_scheduler(client), name="self_growth"); growth_task.add_done_callback(task_done_cb)
-        log.info("タスク起動完了: polling, reflection, job_worker, self_growth")
+        # Gmail監視（ココナラ通知転送）
+        gmail_task = None
+        if gmail_is_configured():
+            gmail_task = asyncio.create_task(gmail_check_scheduler(client, interval=120), name="gmail_monitor")
+            gmail_task.add_done_callback(task_done_cb)
+            log.info("Gmail監視タスク起動")
+        else:
+            log.info("Gmail未設定のためスキップ。python3 gmail.py で初期設定してください。")
+        log.info("タスク起動完了: polling, reflection, job_worker, self_growth" + (", gmail_monitor" if gmail_task else ""))
         while not _shutdown_flag:
             await asyncio.sleep(1)
         log.info("Shutting down...")
-        for t in [poll_task, reflect_task, worker_task, growth_task]: t.cancel()
+        tasks_to_cancel = [poll_task, reflect_task, worker_task, growth_task]
+        if gmail_task:
+            tasks_to_cancel.append(gmail_task)
+        for t in tasks_to_cancel: t.cancel()
         await tg_send(client, "God AI v3.0 停止します")
         state["status"] = "stopped"
         save_state(state)
