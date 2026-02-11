@@ -10,8 +10,39 @@ import shutil
 
 import httpx
 
-from config import GOOGLE_AI_KEY, STATE_PATH, log
+from config import GOOGLE_AI_KEY, GLM_API_KEY, STATE_PATH, log
 from memory import load_state, safe_save_state
+
+# --- 特殊例外クラス ---
+class ClaudeSessionExpired(Exception):
+    """Claude CLIのセッション切れ（再ログイン必要）"""
+    pass
+
+class AIUnavailable(Exception):
+    """Gemini + Claude両方使用不可"""
+    pass
+
+# --- AI一時停止状態 ---
+_ai_paused_until: float = 0  # Unix timestamp（0 = 停止中でない）
+AI_PAUSE_DURATION = 300  # 5分間
+
+def is_ai_paused() -> bool:
+    """AI呼び出しが一時停止中か"""
+    import time
+    return time.time() < _ai_paused_until
+
+def pause_ai():
+    """AI呼び出しを5分間停止"""
+    global _ai_paused_until
+    import time
+    _ai_paused_until = time.time() + AI_PAUSE_DURATION
+    log.warning(f"AI呼び出しを{AI_PAUSE_DURATION}秒間停止")
+
+def get_ai_pause_remaining() -> int:
+    """停止残り秒数（0 = 停止中でない）"""
+    import time
+    remaining = int(_ai_paused_until - time.time())
+    return max(0, remaining)
 
 # Claude CLIのパス（nohup環境でもフルパスで呼べるように）
 CLAUDE_PATH = shutil.which("claude") or "/opt/homebrew/bin/claude"
@@ -27,28 +58,30 @@ def _get_cli_env() -> dict:
         if p not in current_path:
             current_path = f"{p}:{current_path}"
     env["PATH"] = current_path
+    env["HOME"] = "/Users/beny"
     return env
 
 CLI_ENV = _get_cli_env()
 
 # --- 脳の使い分けカウンタ（state.jsonに永続化） ---
-def _load_brain_counts() -> tuple[int, int]:
+def _load_brain_counts() -> tuple[int, int, int]:
     """state.jsonからカウンターを読み込む"""
     try:
         state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        return state.get("gemini_count", 0), state.get("claude_count", 0)
+        return state.get("gemini_count", 0), state.get("glm_count", 0), state.get("claude_count", 0)
     except (json.JSONDecodeError, FileNotFoundError):
-        return 0, 0
+        return 0, 0, 0
 
-async def _save_brain_counts(gemini: int, claude: int):
+async def _save_brain_counts(gemini: int, glm: int, claude: int):
     """state.jsonにカウンターを保存（排他制御あり）"""
     state = load_state()
     state["gemini_count"] = gemini
+    state["glm_count"] = glm
     state["claude_count"] = claude
     await safe_save_state(state)
 
 # メモリ上のカウンタ（起動時にstate.jsonから読み込み）
-_gemini_count, _claude_count = _load_brain_counts()
+_gemini_count, _glm_count, _claude_count = _load_brain_counts()
 
 # --- Gemini API ---
 GEMINI_MODEL = "gemini-2.5-flash-lite"
@@ -56,6 +89,8 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_M
 
 async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
     """Geminiで思考（429リトライ付き）。戻り値: (テキスト, 脳の名前)
+
+    フォールバック順序: Gemini → GLM-4 → Claude CLI
 
     Args:
         prompt: プロンプト
@@ -92,16 +127,73 @@ async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
 
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 _gemini_count += 1
-                await _save_brain_counts(_gemini_count, _claude_count)
+                await _save_brain_counts(_gemini_count, _glm_count, _claude_count)
                 return (text, f"Gemini {GEMINI_MODEL}")
         except Exception as e:
             if attempt < max_retries - 1 and "429" in str(e):
                 log.warning(f"Gemini error (attempt {attempt+1}): {e}, retrying in {retry_delay}s...")
                 await asyncio.sleep(retry_delay)
                 continue
-            log.error(f"Gemini failed: {e}, falling back to Claude CLI")
-            text, _ = await think_claude(prompt)
-            return (text, "Claude CLI (fallback)")
+            # Gemini完全失敗 → GLM-4フォールバック
+            log.error(f"Gemini failed: {e}, falling back to GLM-4")
+            try:
+                text, brain = await think_glm(prompt)
+                return (text, f"{brain} (fallback)")
+            except Exception as glm_error:
+                log.error(f"GLM-4 failed: {glm_error}, falling back to Claude CLI")
+                # GLM失敗 → Claude CLIフォールバック
+                try:
+                    text, _ = await think_claude(prompt)
+                    return (text, "Claude CLI (fallback)")
+                except ClaudeSessionExpired:
+                    # 全部失敗 → AI一時停止
+                    pause_ai()
+                    raise AIUnavailable("Gemini 429 + GLM失敗 + Claude CLIセッション切れ。会話不可")
+
+# --- GLM-4 API (智谱AI) ---
+GLM_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+async def think_glm(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
+    """GLM-4で思考（Geminiのバックアップ）。戻り値: (テキスト, 脳の名前)
+
+    Args:
+        prompt: プロンプト
+        max_tokens: 最大出力トークン数
+    """
+    global _glm_count
+    if not GLM_API_KEY:
+        raise Exception("GLM_API_KEY not configured")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                GLM_URL,
+                headers={
+                    "Authorization": f"Bearer {GLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "glm-4-flash",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                },
+                timeout=30,
+            )
+            data = resp.json()
+
+            if resp.status_code != 200:
+                raise Exception(f"GLM API error: {resp.status_code} - {data}")
+
+            if "choices" not in data or not data["choices"]:
+                raise Exception(f"GLM API invalid response: {data}")
+
+            text = data["choices"][0]["message"]["content"]
+            _glm_count += 1
+            await _save_brain_counts(_gemini_count, _glm_count, _claude_count)
+            return (text, "GLM-4")
+    except Exception as e:
+        log.error(f"GLM-4 failed: {e}")
+        raise
 
 # --- Claude CLI ---
 async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
@@ -120,7 +212,13 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
     original_prompt = prompt
 
+    # 段階的タイムアウト設定
+    timeouts = [60, 90, 120]
+    sleep_between_retries = 5
+
     for attempt in range(3):
+        current_timeout = timeouts[attempt]
+
         # 2回目以降はプロンプトを短縮
         if attempt == 1:
             # プロンプトを最後の1000文字に短縮
@@ -131,7 +229,7 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
         try:
             result = await loop.run_in_executor(
                 None,
-                lambda p=prompt, t=timeout: subprocess.run(
+                lambda p=prompt, t=current_timeout: subprocess.run(
                     [CLAUDE_PATH, "--print", "-p", p],
                     capture_output=True, text=True, timeout=t,
                     env=CLI_ENV,
@@ -143,16 +241,22 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
 
             if result.returncode == 0 and result.stdout.strip():
                 _claude_count += 1
-                await _save_brain_counts(_gemini_count, _claude_count)
+                await _save_brain_counts(_gemini_count, _glm_count, _claude_count)
                 return (result.stdout.strip(), "Claude CLI")
-            # 詳細なエラーログ（stdout/stderr両方、プロンプト長も）
+
+            # "Not logged in" チェック（即座に例外、リトライ不要）
             stdout_full = result.stdout if result.stdout else "(empty)"
+            if "Not logged in" in stdout_full:
+                log.error("Claude CLI: セッション切れ。再ログインが必要 (claude setup-token)")
+                raise ClaudeSessionExpired("Claude CLI session expired - run 'claude setup-token'")
+
+            # 詳細なエラーログ（stdout/stderr両方、プロンプト長も）
             stderr_full = result.stderr if result.stderr else "(empty)"
-            log.error(f"Claude CLI attempt {attempt+1}: returncode={result.returncode}, prompt_len={len(prompt)}, timeout={timeout}s")
+            log.error(f"Claude CLI attempt {attempt+1}: returncode={result.returncode}, prompt_len={len(prompt)}, timeout={current_timeout}s")
             log.error(f"  stdout: {stdout_full[:500]}")
             log.error(f"  stderr: {stderr_full[:500]}")
         except subprocess.TimeoutExpired:
-            log.error(f"Claude CLI attempt {attempt+1}: timeout ({timeout}s)")
+            log.error(f"Claude CLI attempt {attempt+1}: timeout ({current_timeout}s)")
             # 3回目のタイムアウトはGeminiにフォールバック
             if attempt == 2:
                 log.warning("Claude CLI 3回タイムアウト、Geminiにフォールバック")
@@ -164,24 +268,40 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                     raise RuntimeError(f"Claude CLI and Gemini both failed: {e}")
         except Exception as e:
             log.error(f"Claude CLI attempt {attempt+1}: {e}")
+
         if attempt < 2:
-            await asyncio.sleep(3)
-    raise RuntimeError(f"Claude CLI failed after 3 attempts (timeout={timeout}s)")
+            await asyncio.sleep(sleep_between_retries)
+
+    raise RuntimeError(f"Claude CLI failed after 3 attempts (timeouts={timeouts}s)")
 
 # --- 統合思考関数 ---
 async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
-    """統合思考関数。戻り値: (テキスト, 脳の名前)"""
+    """統合思考関数。戻り値: (テキスト, 脳の名前)
+
+    Raises:
+        AIUnavailable: AI一時停止中の場合
+    """
+    # AI一時停止チェック
+    if is_ai_paused():
+        remaining = get_ai_pause_remaining()
+        raise AIUnavailable(f"AI一時停止中（残り{remaining}秒）。claude setup-token を実行してください")
+
     if heavy:
-        return await think_claude(prompt)
+        try:
+            return await think_claude(prompt)
+        except ClaudeSessionExpired:
+            # Claude CLIセッション切れ → Geminiにフォールバック
+            log.warning("Claude CLI セッション切れ、Geminiにフォールバック")
+            return await think_gemini(prompt)
     return await think_gemini(prompt)
 
 def is_heavy(message: str) -> bool:
     from config import HEAVY_KEYWORDS
     return any(kw in message for kw in HEAVY_KEYWORDS)
 
-def get_brain_counts() -> tuple[int, int]:
-    """(gemini_count, claude_count) を返す（state.jsonから永続化された値）"""
-    return _gemini_count, _claude_count
+def get_brain_counts() -> tuple[int, int, int]:
+    """(gemini_count, glm_count, claude_count) を返す（state.jsonから永続化された値）"""
+    return _gemini_count, _glm_count, _claude_count
 
 
 # --- アクション意図検出 ---
