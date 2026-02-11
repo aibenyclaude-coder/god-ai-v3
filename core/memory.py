@@ -56,8 +56,20 @@ async def safe_save_state(state: dict):
 
 # --- Journal管理 ---
 def append_journal(text: str):
-    with open(JOURNAL_PATH, "a", encoding="utf-8") as f:
-        f.write(f"\n{text}\n")
+    """Journalファイルにテキストを追記する"""
+    try:
+        with open(JOURNAL_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n{text}\n")
+    except FileNotFoundError:
+        log.error(f"Journal file not found at {JOURNAL_PATH}. Creating it.")
+        try:
+            JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(JOURNAL_PATH, "w", encoding="utf-8") as f:
+                f.write(f"{text}\n")
+        except Exception as e:
+            log.error(f"Failed to create journal file and write: {e}")
+    except Exception as e:
+        log.error(f"Failed to append to journal file {JOURNAL_PATH}: {e}")
 
 async def safe_append_journal(text: str):
     async with get_write_lock():
