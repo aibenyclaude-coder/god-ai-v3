@@ -24,7 +24,8 @@ from memory import (
     append_journal, read_file, load_identity, init_write_lock
 )
 from brain import think, is_heavy, get_brain_counts, detect_action_intent, AIUnavailable, is_ai_paused, get_ai_pause_remaining
-from jobqueue import get_job_queue, job_worker, format_queue_status, init_job_queue, create_job, Priority, signal_p1_interrupt
+from jobqueue import format_queue_status, format_jobs_list, init_job_queue, signal_p1_interrupt
+from job_worker import job_worker_loop
 from growth import reflection_cycle, reflection_scheduler, self_growth_scheduler, is_reflecting, get_stats_summary, get_auto_suggestions
 from gmail import gmail_check_scheduler, is_configured as gmail_is_configured
 
@@ -149,6 +150,8 @@ async def handle_message(client: httpx.AsyncClient, message: str) -> str:
         return await _handle_drive_command()
     if msg_stripped == "/queue":
         return format_queue_status()
+    if msg_stripped == "/jobs":
+        return format_jobs_list()
     if msg_stripped == "/stats":
         return _handle_stats_command()
     if msg_stripped.startswith("/tweet "):
@@ -446,7 +449,7 @@ async def main():
     log.info(f"Base: {BASE_DIR}")
     log.info("=" * 50)
     async with httpx.AsyncClient() as client:
-        await tg_send(client, "God AI v3.0 起動完了\n/status で状態確認\n/reflect で振り返り\n/drive でDriveバックアップ\n/queue でジョブキュー状態\n/stats で成長統計\n/tweet <テキスト> でツイート投稿")
+        await tg_send(client, "God AI v3.0 起動完了\n/status で状態確認\n/reflect で振り返り\n/drive でDriveバックアップ\n/queue でジョブキュー状態\n/jobs でジョブ一覧\n/stats で成長統計\n/tweet <テキスト> でツイート投稿")
         def task_done_cb(task: asyncio.Task):
             if task.cancelled(): return
             exc = task.exception()
@@ -455,7 +458,7 @@ async def main():
                 append_journal(f"### {datetime.now().strftime('%H:%M')} タスク異常終了: {task.get_name()}\n{exc}")
         poll_task = asyncio.create_task(polling_loop(client), name="polling"); poll_task.add_done_callback(task_done_cb)
         reflect_task = asyncio.create_task(reflection_scheduler(client), name="reflection"); reflect_task.add_done_callback(task_done_cb)
-        worker_task = asyncio.create_task(job_worker(client), name="job_worker"); worker_task.add_done_callback(task_done_cb)
+        worker_task = asyncio.create_task(job_worker_loop(client), name="job_worker"); worker_task.add_done_callback(task_done_cb)
         growth_task = asyncio.create_task(self_growth_scheduler(client), name="self_growth"); growth_task.add_done_callback(task_done_cb)
         # Gmail監視（ココナラ通知転送）
         gmail_task = None
