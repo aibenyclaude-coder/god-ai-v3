@@ -51,6 +51,185 @@ def is_reflecting() -> bool:
     return _reflecting
 
 
+# --- 成長統計パス ---
+GROWTH_STATS_PATH = MEMORY_DIR / "growth_stats.json"
+
+
+# --- 成長統計関数 ---
+def load_growth_stats() -> dict:
+    """成長統計を読み込む"""
+    default_stats = {
+        "total_attempts": 0,
+        "total_successes": 0,
+        "total_failures": 0,
+        "success_rate": 0.0,
+        "failure_reasons": {"syntax_error": 0, "timeout": 0, "test_fail": 0, "duplicate": 0},
+        "modules_improved": {"brain.py": 0, "growth.py": 0, "god.py": 0, "memory.py": 0, "config.py": 0, "jobqueue.py": 0},
+        "avg_improvement_time": 0,
+        "last_10_results": [],
+        "streak": {"current_success": 0, "best_success": 0}
+    }
+    if GROWTH_STATS_PATH.exists():
+        try:
+            with open(GROWTH_STATS_PATH, "r", encoding="utf-8") as f:
+                stats = json.load(f)
+                # 欠けているキーを補完
+                for key, value in default_stats.items():
+                    if key not in stats:
+                        stats[key] = value
+                return stats
+        except Exception as e:
+            log.warning(f"成長統計読み込み失敗: {e}")
+    return default_stats
+
+
+def save_growth_stats(stats: dict):
+    """成長統計を保存"""
+    try:
+        with open(GROWTH_STATS_PATH, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+        log.debug(f"成長統計保存: {GROWTH_STATS_PATH}")
+    except Exception as e:
+        log.error(f"成長統計保存失敗: {e}")
+
+
+def update_growth_stats(success: bool, failure_reason: str | None, module: str, duration: float):
+    """成長統計を更新
+
+    Args:
+        success: 改善が成功したか
+        failure_reason: 失敗理由（"syntax_error", "timeout", "test_fail", "duplicate"）
+        module: 対象モジュール名（例: "brain.py"）
+        duration: 改善にかかった時間（秒）
+    """
+    stats = load_growth_stats()
+
+    # 試行回数を更新
+    stats["total_attempts"] += 1
+
+    if success:
+        stats["total_successes"] += 1
+        stats["streak"]["current_success"] += 1
+        if stats["streak"]["current_success"] > stats["streak"]["best_success"]:
+            stats["streak"]["best_success"] = stats["streak"]["current_success"]
+
+        # モジュール改善回数を更新
+        module_key = f"{module}.py" if not module.endswith(".py") else module
+        if module_key in stats["modules_improved"]:
+            stats["modules_improved"][module_key] += 1
+        else:
+            stats["modules_improved"][module_key] = 1
+    else:
+        stats["total_failures"] += 1
+        stats["streak"]["current_success"] = 0
+
+        # 失敗理由を更新
+        if failure_reason and failure_reason in stats["failure_reasons"]:
+            stats["failure_reasons"][failure_reason] += 1
+
+    # 成功率を計算
+    if stats["total_attempts"] > 0:
+        stats["success_rate"] = round(stats["total_successes"] / stats["total_attempts"] * 100, 1)
+
+    # 平均改善時間を更新（成功時のみ）
+    if success and duration > 0:
+        if stats["avg_improvement_time"] == 0:
+            stats["avg_improvement_time"] = duration
+        else:
+            # 移動平均で更新
+            stats["avg_improvement_time"] = round(
+                (stats["avg_improvement_time"] * 0.8 + duration * 0.2), 1
+            )
+
+    # 直近10回の結果を記録
+    result_entry = {
+        "time": datetime.now().isoformat(),
+        "success": success,
+        "module": module,
+        "failure_reason": failure_reason,
+        "duration": round(duration, 1)
+    }
+    stats["last_10_results"].append(result_entry)
+    if len(stats["last_10_results"]) > 10:
+        stats["last_10_results"] = stats["last_10_results"][-10:]
+
+    save_growth_stats(stats)
+    log.info(f"成長統計更新: success={success}, module={module}, duration={duration:.1f}s")
+
+
+def get_stats_summary() -> str:
+    """統計サマリーを取得（Telegram表示用）"""
+    stats = load_growth_stats()
+
+    # 成功率
+    total = stats["total_attempts"]
+    successes = stats["total_successes"]
+    rate = stats["success_rate"]
+
+    # 最多失敗原因
+    failure_reasons = stats["failure_reasons"]
+    max_failure = max(failure_reasons.items(), key=lambda x: x[1]) if any(v > 0 for v in failure_reasons.values()) else ("なし", 0)
+
+    # 最も改善されたモジュール
+    modules = stats["modules_improved"]
+    max_module = max(modules.items(), key=lambda x: x[1]) if any(v > 0 for v in modules.values()) else ("なし", 0)
+
+    # 連続成功
+    streak = stats["streak"]["current_success"]
+
+    return (
+        f"成功率: {rate}% ({successes}/{total})\n"
+        f"連続成功: {streak}回\n"
+        f"最多失敗原因: {max_failure[0]} ({max_failure[1]}回)\n"
+        f"最も改善されたモジュール: {max_module[0]} ({max_module[1]}回)"
+    )
+
+
+def should_skip_improvement(improvement_text: str, module: str) -> tuple[bool, str]:
+    """統計に基づいて改善をスキップすべきか判定
+
+    Args:
+        improvement_text: 改善内容のテキスト
+        module: 対象モジュール名
+
+    Returns:
+        (スキップすべきか, 理由)
+    """
+    stats = load_growth_stats()
+
+    # 直近10回の結果から同じ失敗パターンをチェック
+    recent = stats["last_10_results"]
+
+    # 同じ原因で3回以上失敗しているかチェック
+    failure_counts = {}
+    for result in recent:
+        if not result["success"] and result["failure_reason"]:
+            reason = result["failure_reason"]
+            failure_counts[reason] = failure_counts.get(reason, 0) + 1
+
+    for reason, count in failure_counts.items():
+        if count >= 3:
+            return (True, f"同じ原因({reason})で{count}回失敗しています")
+
+    return (False, "")
+
+
+def get_recommended_module() -> str | None:
+    """統計に基づいて改善推奨モジュールを取得
+
+    成功率が高いモジュールを優先
+    """
+    stats = load_growth_stats()
+    modules = stats["modules_improved"]
+
+    # 改善実績があるモジュールを成功回数でソート
+    if not any(v > 0 for v in modules.values()):
+        return None
+
+    sorted_modules = sorted(modules.items(), key=lambda x: x[1], reverse=True)
+    return sorted_modules[0][0] if sorted_modules else None
+
+
 # --- CLAUDE.md 読み込み ---
 def load_claude_md() -> str:
     """CLAUDE.mdの内容を読み込む"""
@@ -480,6 +659,8 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient) -> str:
 
             if check_duplicate_improvements(journal_full, improvement_text):
                 log.info("重複した改善提案を検出。自己改善をスキップします。")
+                # 重複検出も統計に記録
+                update_growth_stats(success=False, failure_reason="duplicate", module="unknown", duration=0)
                 skip_msg = f"### {now} 自己改善スキップ（重複検出）\n改善内容: {improvement_text}"
                 await safe_append_journal(skip_msg)
                 await tg_send(client, f"重複した改善提案を検出。既に適用済みの可能性が高いためスキップしました。\n提案: {improvement_text[:200]}")
@@ -494,10 +675,11 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient) -> str:
 
 # --- 自己改善 ---
 async def self_improve(client: httpx.AsyncClient, reflection: str):
-    """コード自己改善（構文チェック強化、最大3回リトライ、モジュール選択）"""
+    """コード自己改善（構文チェック強化、最大3回リトライ、モジュール選択、統計記録）"""
     from god import tg_send
 
     log.info("自己改善プロセス開始")
+    start_time = time_module.time()
 
     # 改善行を抽出
     improvements = []
@@ -513,6 +695,15 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
     # 改善対象モジュールを自動選択
     target_path, target_name = select_target_module(improvement_text)
     log.info(f"改善対象モジュール: {target_name} ({target_path})")
+
+    # 統計に基づくスキップ判定
+    should_skip, skip_reason = should_skip_improvement(improvement_text, target_name)
+    if should_skip:
+        log.info(f"統計判定により自己改善スキップ: {skip_reason}")
+        now = datetime.now().strftime("%H:%M")
+        await safe_append_journal(f"### {now} 自己改善スキップ（統計判定）\n理由: {skip_reason}\n改善内容: {improvement_text}")
+        await tg_send(client, f"自己改善スキップ（統計判定）\n理由: {skip_reason}")
+        return
 
     # バックアップ
     backup_path = target_path.with_suffix(".py.bak")
@@ -622,6 +813,8 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
 
             if test_passed:
                 # 全テスト合格 -> 改善確定
+                duration = time_module.time() - start_time
+                update_growth_stats(success=True, failure_reason=None, module=target_name, duration=duration)
                 success_msg = f"自己改善成功（試行{attempt}/{MAX_RETRY}）\n対象: {target_name}.py\n改善内容: {improvement_text}"
                 append_journal(
                     f"### {datetime.now().strftime('%H:%M')} {success_msg}\n"
@@ -639,6 +832,12 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 failed_tests = [line for line in test_result.splitlines() if line.startswith("❌")]
                 failed_test_name = failed_tests[0] if failed_tests else "不明なテスト"
                 log.error(f"試行{attempt}: 自動テスト失敗、ロールバック実行: {failed_test_name}")
+
+                # 最後の試行で失敗した場合のみ統計更新
+                if attempt == MAX_RETRY:
+                    duration = time_module.time() - start_time
+                    update_growth_stats(success=False, failure_reason="test_fail", module=target_name, duration=duration)
+
                 append_journal(
                     f"### {datetime.now().strftime('%H:%M')} 自己改善 試行{attempt}/{MAX_RETRY} テスト失敗でロールバック\n"
                     f"❌ {failed_test_name}\n{test_result}\n改善内容: {improvement_text}"
@@ -651,6 +850,12 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
         except (SyntaxError, ValueError) as e:
             last_error = str(e)
             log.error(f"自己改善 試行{attempt}/{MAX_RETRY} 失敗: {e}")
+
+            # 最後の試行で失敗した場合のみ統計更新
+            if attempt == MAX_RETRY:
+                duration = time_module.time() - start_time
+                update_growth_stats(success=False, failure_reason="syntax_error", module=target_name, duration=duration)
+
             append_journal(
                 f"### {datetime.now().strftime('%H:%M')} 自己改善 試行{attempt}/{MAX_RETRY} 失敗\n"
                 f"エラー: {e}\n改善内容: {improvement_text}"
@@ -662,6 +867,11 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
         except Exception as e:
             last_error = str(e)
             log.error(f"自己改善 試行{attempt}/{MAX_RETRY} 予期せぬエラー: {e}", exc_info=True)
+
+            # 予期しないエラーは即座に統計更新（timeout扱い）
+            duration = time_module.time() - start_time
+            update_growth_stats(success=False, failure_reason="timeout", module=target_name, duration=duration)
+
             append_journal(
                 f"### {datetime.now().strftime('%H:%M')} 自己改善 試行{attempt}/{MAX_RETRY} 予期せぬエラー\n"
                 f"エラー: {e}\n改善内容: {improvement_text}"
@@ -716,15 +926,51 @@ async def reflection_scheduler(client: httpx.AsyncClient):
 
 # --- 自己成長提案ジョブ ---
 async def _self_growth_job(client: httpx.AsyncClient):
-    """自己成長提案ジョブの実行"""
+    """自己成長提案ジョブの実行（統計活用版）"""
     log.info("自己成長提案ジョブ開始")
     state = load_state()
     journal_tail = read_file(JOURNAL_PATH, tail=30)
+
+    # 成長統計を取得してプロンプトに活用
+    stats = load_growth_stats()
+    stats_summary = get_stats_summary()
+
+    # 統計に基づく追加ガイダンスを生成
+    guidance_lines = []
+
+    # 失敗理由の分析
+    failure_reasons = stats["failure_reasons"]
+    for reason, count in failure_reasons.items():
+        if count >= 3:
+            if reason == "timeout":
+                guidance_lines.append(f"- タイムアウトが{count}回発生。処理の軽量化やモジュール分割を検討")
+            elif reason == "syntax_error":
+                guidance_lines.append(f"- 構文エラーが{count}回発生。より慎重なコード生成が必要")
+            elif reason == "test_fail":
+                guidance_lines.append(f"- テスト失敗が{count}回発生。テストカバレッジの改善を検討")
+            elif reason == "duplicate":
+                guidance_lines.append(f"- 重複提案が{count}回発生。より新しい観点での提案が必要")
+
+    # 成功率が低いモジュールの回避、高いモジュールの優先
+    modules = stats["modules_improved"]
+    if any(v > 0 for v in modules.values()):
+        sorted_modules = sorted(modules.items(), key=lambda x: x[1], reverse=True)
+        top_module = sorted_modules[0]
+        if top_module[1] > 0:
+            guidance_lines.append(f"- 推奨モジュール: {top_module[0]}（過去{top_module[1]}回成功）")
+
+    guidance_text = "\n".join(guidance_lines) if guidance_lines else "(特になし)"
 
     prompt = f"""あなたはGod AI。自律型AIとして自己成長を提案せよ。
 
 【現在の状態】
 {json.dumps(state, ensure_ascii=False)}
+
+【成長統計】
+{stats_summary}
+
+【統計に基づく改善ガイダンス】
+{guidance_text}
 
 【最近のjournal】
 {journal_tail}
@@ -735,6 +981,12 @@ async def _self_growth_job(client: httpx.AsyncClient):
 2. パフォーマンス改善の提案
 3. コード品質向上の提案
 4. ユーザー体験改善の提案
+
+【重要な制約】
+- 統計に基づくガイダンスを考慮すること
+- 過去に何度も失敗している種類の改善は避けること
+- 成功率の高いモジュールを優先すること
+- タイムアウトが多い場合はモジュール分割を検討すること
 
 簡潔に日本語で提案せよ。
 実装可能な具体的提案を「GROWTH_PROPOSAL:」で始まる行に書け。"""

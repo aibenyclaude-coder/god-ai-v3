@@ -12,8 +12,9 @@ from datetime import datetime, timezone
 
 import httpx
 
+import re
 from config import (
-    BASE_DIR, TG_BASE, BENY_CHAT_ID, PID_FILE, JOURNAL_PATH,
+    BASE_DIR, MEMORY_DIR, TG_BASE, BENY_CHAT_ID, PID_FILE, JOURNAL_PATH,
     IDENTITY_PATH, STATE_PATH, GOD_PY_PATH, log
 )
 from memory import (
@@ -22,7 +23,7 @@ from memory import (
 )
 from brain import think, is_heavy, get_brain_counts
 from jobqueue import get_job_queue, job_worker, format_queue_status, init_job_queue
-from growth import reflection_cycle, reflection_scheduler, self_growth_scheduler, is_reflecting
+from growth import reflection_cycle, reflection_scheduler, self_growth_scheduler, is_reflecting, get_stats_summary
 
 # --- PIDファイルによる重複プロセス防止 ---
 def check_single_instance():
@@ -81,11 +82,18 @@ async def handle_message(client: httpx.AsyncClient, message: str) -> str:
         return await _handle_drive_command()
     if message.strip() == "/queue":
         return format_queue_status()
+    if message.strip() == "/stats":
+        return _handle_stats_command()
     if message.strip().startswith("/tweet "):
         return await _handle_tweet_command(message[7:].strip())
     if message.strip().startswith("ツイートして:") or message.strip().startswith("ツイートして："):
         tweet_text = message.split(":", 1)[1].strip() if ":" in message else message.split("：", 1)[1].strip()
         return await _handle_tweet_command(tweet_text)
+
+    # ファイル追記: 「<ファイル名>に追記: <内容>」
+    append_match = re.match(r'^(.+\.md)に追記[:：]\s*(.+)$', message.strip(), re.DOTALL)
+    if append_match:
+        return _handle_file_append(append_match.group(1), append_match.group(2))
 
     heavy = is_heavy(message)
     identity = load_identity()
@@ -136,6 +144,46 @@ async def _handle_tweet_command(tweet_text: str) -> str:
         return "twitter.py が見つかりません"
     except Exception as e:
         return f"ツイートエラー: {e}"
+
+def _handle_stats_command() -> str:
+    """成長統計を表示"""
+    try:
+        summary = get_stats_summary()
+        return f"📊 成長統計\n{summary}"
+    except Exception as e:
+        log.error(f"統計取得エラー: {e}")
+        return f"統計取得エラー: {e}"
+
+def _handle_file_append(filename: str, content: str) -> str:
+    """memory/配下の.mdファイルに追記"""
+    try:
+        # セキュリティ: ファイル名のサニタイズ
+        safe_filename = filename.replace("/", "").replace("\\", "").replace("..", "")
+        if not safe_filename.endswith(".md"):
+            return "❌ .mdファイルのみ対応しています"
+
+        target_path = MEMORY_DIR / safe_filename
+
+        # memory/配下であることを確認（パストラバーサル防止）
+        try:
+            target_path.resolve().relative_to(MEMORY_DIR.resolve())
+        except ValueError:
+            return "❌ memory/配下のファイルのみ編集可能です"
+
+        # ファイルが存在しない場合は新規作成
+        if not target_path.exists():
+            target_path.write_text(f"# {safe_filename.replace('.md', '')}\n\n", encoding="utf-8")
+
+        # 追記
+        with open(target_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{content}\n")
+
+        log.info(f"ファイル追記完了: {safe_filename}")
+        return f"✅ {safe_filename}に追記完了"
+
+    except Exception as e:
+        log.error(f"ファイル追記エラー: {e}")
+        return f"❌ 追記エラー: {e}"
 
 def format_status(state: dict) -> str:
     gemini_count, claude_count = get_brain_counts()
@@ -239,7 +287,7 @@ async def main():
     log.info(f"Base: {BASE_DIR}")
     log.info("=" * 50)
     async with httpx.AsyncClient() as client:
-        await tg_send(client, "God AI v3.0 起動完了\n/status で状態確認\n/reflect で振り返り\n/drive でDriveバックアップ\n/queue でジョブキュー状態\n/tweet <テキスト> でツイート投稿")
+        await tg_send(client, "God AI v3.0 起動完了\n/status で状態確認\n/reflect で振り返り\n/drive でDriveバックアップ\n/queue でジョブキュー状態\n/stats で成長統計\n/tweet <テキスト> でツイート投稿")
         def task_done_cb(task: asyncio.Task):
             if task.cancelled(): return
             exc = task.exception()

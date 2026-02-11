@@ -1,0 +1,11 @@
+{
+  "total_attempts": 0,
+  "total_successes": 0,
+  "total_failures": 0,
+  "success_rate": 0.0,
+  "failure_reasons": {"syntax_error": 0, "timeout": 0, "test_fail": 0, "duplicate": 0},
+  "modules_improved": {"brain.py": 0, "growth.py": 0, "god.py": 0, "memory.py": 0, "config.py": 0, "jobqueue.py": 0},
+  "avg_improvement_time": 0,
+  "last_10_results": [],
+  "streak": {"current_success": 0, "best_success": 0}
+}
