@@ -837,28 +837,58 @@ def apply_patches(module_path: Path, patches: list[tuple[str, str]]) -> tuple[bo
             log.info(f"パッチ {i+1}/{len(patches)} 適用成功")
         else:
             # 改行・空白の微妙な差異に対応: 前後の空白をnormalizeして再試行
-            before_normalized = "\n".join(line.rstrip() for line in before.splitlines())
-            code_normalized = "\n".join(line.rstrip() for line in code.splitlines())
-            if before_normalized in code_normalized:
-                # normalized版で位置を特定し、元のコードで置換
-                idx = code_normalized.find(before_normalized)
-                # 元のコードでの対応位置を計算
-                original_lines = code.splitlines(keepends=True)
-                norm_lines = code_normalized.splitlines(keepends=True)
-                # 行単位で対応
-                before_line_count = len(before_normalized.splitlines())
-                norm_pos = code_normalized[:idx].count("\n")
-                # 元コードの該当行を置換
-                orig_lines = code.splitlines(keepends=True)
-                before_lines = orig_lines[norm_pos:norm_pos + before_line_count]
-                before_original = "".join(before_lines)
-                code = code.replace(before_original, after + "\n" if not after.endswith("\n") else after, 1)
+            # Before節とAfter節の末尾に改行がない場合、置換後に改行が欠落するのを防ぐ
+            normalized_before = "\n".join(line.rstrip() for line in before.splitlines())
+            normalized_after = "\n".join(line.rstrip() for line in after.splitlines())
+
+            if normalized_before in code:
+                # normalizationなしで直接置換（改行ずれが少ない場合）
+                code = code.replace(before, after, 1)
                 applied_count += 1
-                log.info(f"パッチ {i+1}/{len(patches)} 適用成功（normalized match）")
+                log.info(f"パッチ {i+1}/{len(patches)} 適用成功（直接置換）")
             else:
-                error_msg = f"パッチ {i+1}/{len(patches)} 適用失敗: BEFORE部分がコード内に見つかりません\nBEFORE先頭: {before[:100]}"
-                log.error(error_msg)
-                return (False, original_code, error_msg)
+                # normalization版で位置を特定し、元のコードで置換
+                try:
+                    code_lines = code.splitlines(keepends=True)
+                    normalized_code_lines = [line.rstrip() for line in code_lines]
+                    normalized_code = "\n".join(normalized_code_lines)
+
+                    start_index = normalized_code.find(normalized_before)
+                    if start_index == -1:
+                        raise ValueError("Normalized BEFORE not found in normalized code")
+
+                    # 元のコードでの正確な位置を計算
+                    current_index = 0
+                    original_start_index = -1
+                    original_lines_count = 0
+                    for idx, line in enumerate(code_lines):
+                        stripped_line = line.rstrip()
+                        if current_index == start_index and stripped_line == normalized_before.splitlines()[0].rstrip():
+                            original_start_index = sum(len(l) for l in code_lines[:idx])
+                            break
+                        current_index += len(line)
+                        if stripped_line == normalized_before.splitlines()[original_lines_count].rstrip():
+                            original_lines_count += 1
+                        else:
+                            original_lines_count = 0 # Reset if line doesn't match
+
+                    if original_start_index == -1:
+                        raise ValueError("Could not find exact original position for replacement")
+
+                    # After節の末尾に改行がない場合、afterに改行を追加
+                    if not after.endswith('\n') and not code[original_start_index + len(before):].startswith('\n'):
+                         after_with_newline = after + '\n'
+                    else:
+                        after_with_newline = after
+
+                    code = code[:original_start_index] + after_with_newline + code[original_start_index + len(before):]
+                    applied_count += 1
+                    log.info(f"パッチ {i+1}/{len(patches)} 適用成功（normalized match）")
+
+                except Exception as e:
+                    error_msg = f"パッチ {i+1}/{len(patches)} 適用失敗: BEFORE部分がコード内に見つかりません（正規化後も）\nBEFORE先頭: {before[:100]}\n詳細: {e}"
+                    log.error(error_msg)
+                    return (False, original_code, error_msg)
 
     if applied_count == 0:
         return (False, original_code, "適用されたパッチがありません")
