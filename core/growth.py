@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import difflib
+import importlib
 import json
 import os
 import re
@@ -13,15 +14,21 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import httpx
 
 import time as time_module
 
+import hashlib
+
 from config import (
     GOD_PY_PATH, JOURNAL_PATH, REFLECTION_INTERVAL, SELF_GROWTH_INTERVAL, log,
     BASE_DIR, CORE_DIR, STATE_PATH, IDENTITY_PATH, MEMORY_DIR
 )
+
+# --- 改善履歴パス ---
+IMPROVEMENT_HISTORY_PATH = MEMORY_DIR / "improvement_history.json"
 from memory import (
     load_state, save_state, read_file, append_journal,
     safe_save_state, safe_append_journal
@@ -63,7 +70,7 @@ def load_growth_stats() -> dict:
         "total_successes": 0,
         "total_failures": 0,
         "success_rate": 0.0,
-        "failure_reasons": {"syntax_error": 0, "timeout": 0, "test_fail": 0, "duplicate": 0},
+        "failure_reasons": {"syntax_error": 0, "timeout": 0, "test_fail": 0, "duplicate": 0, "rollback": 0},
         "modules_improved": {"brain.py": 0, "growth.py": 0, "god.py": 0, "memory.py": 0, "config.py": 0, "jobqueue.py": 0},
         "avg_improvement_time": 0,
         "last_10_results": [],
@@ -166,9 +173,17 @@ def get_stats_summary() -> str:
     successes = stats["total_successes"]
     rate = stats["success_rate"]
 
-    # 最多失敗原因
+    # 最多失敗原因（日本語表示）
     failure_reasons = stats["failure_reasons"]
+    reason_names = {
+        "syntax_error": "構文エラー",
+        "timeout": "タイムアウト",
+        "test_fail": "テスト失敗",
+        "duplicate": "重複提案",
+        "rollback": "ロールバック"
+    }
     max_failure = max(failure_reasons.items(), key=lambda x: x[1]) if any(v > 0 for v in failure_reasons.values()) else ("なし", 0)
+    max_failure_name = reason_names.get(max_failure[0], max_failure[0]) if max_failure[0] != "なし" else "なし"
 
     # 最も改善されたモジュール
     modules = stats["modules_improved"]
@@ -176,12 +191,18 @@ def get_stats_summary() -> str:
 
     # 連続成功
     streak = stats["streak"]["current_success"]
+    best_streak = stats["streak"]["best_success"]
+
+    # 平均改善時間
+    avg_time = stats.get("avg_improvement_time", 0)
+    avg_time_str = f"{avg_time:.1f}秒" if avg_time > 0 else "N/A"
 
     return (
         f"成功率: {rate}% ({successes}/{total})\n"
-        f"連続成功: {streak}回\n"
-        f"最多失敗原因: {max_failure[0]} ({max_failure[1]}回)\n"
-        f"最も改善されたモジュール: {max_module[0]} ({max_module[1]}回)"
+        f"連続成功: {streak}回 (最高: {best_streak}回)\n"
+        f"最多失敗原因: {max_failure_name} ({max_failure[1]}回)\n"
+        f"最も改善されたモジュール: {max_module[0]} ({max_module[1]}回)\n"
+        f"平均改善時間: {avg_time_str}"
     )
 
 
@@ -207,9 +228,27 @@ def should_skip_improvement(improvement_text: str, module: str) -> tuple[bool, s
             reason = result["failure_reason"]
             failure_counts[reason] = failure_counts.get(reason, 0) + 1
 
+    reason_names = {
+        "syntax_error": "構文エラー",
+        "timeout": "タイムアウト",
+        "test_fail": "テスト失敗",
+        "duplicate": "重複提案",
+        "rollback": "ロールバック"
+    }
+
     for reason, count in failure_counts.items():
         if count >= 3:
-            return (True, f"同じ原因({reason})で{count}回失敗しています")
+            reason_jp = reason_names.get(reason, reason)
+            return (True, f"同じ原因({reason_jp})で{count}回失敗しています")
+
+    # 特定モジュールで連続失敗しているかチェック
+    module_failure_count = 0
+    for result in recent[-5:]:  # 直近5回をチェック
+        if not result["success"] and result.get("module") == module:
+            module_failure_count += 1
+
+    if module_failure_count >= 3:
+        return (True, f"モジュール({module})で直近{module_failure_count}回連続失敗中")
 
     return (False, "")
 
@@ -228,6 +267,40 @@ def get_recommended_module() -> str | None:
 
     sorted_modules = sorted(modules.items(), key=lambda x: x[1], reverse=True)
     return sorted_modules[0][0] if sorted_modules else None
+
+
+def get_auto_suggestions() -> list[str]:
+    """統計に基づいて自動提案を生成
+
+    Returns:
+        提案リスト
+    """
+    stats = load_growth_stats()
+    suggestions = []
+
+    failure_reasons = stats["failure_reasons"]
+
+    # タイムアウトが3回以上 -> モジュール分割を提案
+    if failure_reasons.get("timeout", 0) >= 3:
+        suggestions.append("タイムアウトが頻発しています。大きいモジュールの分割を検討してください。")
+
+    # 構文エラーが3回以上 -> コードレビュー強化を提案
+    if failure_reasons.get("syntax_error", 0) >= 3:
+        suggestions.append("構文エラーが多発しています。生成コードの検証強化を検討してください。")
+
+    # テスト失敗が3回以上 -> テストカバレッジ改善を提案
+    if failure_reasons.get("test_fail", 0) >= 3:
+        suggestions.append("テスト失敗が多発しています。テストカバレッジの改善を検討してください。")
+
+    # 重複提案が3回以上 -> 新しい観点を提案
+    if failure_reasons.get("duplicate", 0) >= 3:
+        suggestions.append("重複提案が多発しています。より新しい観点での改善を検討してください。")
+
+    # 成功率が低い場合
+    if stats["total_attempts"] >= 5 and stats["success_rate"] < 30:
+        suggestions.append(f"成功率が{stats['success_rate']}%と低めです。改善提案の品質向上を検討してください。")
+
+    return suggestions
 
 
 # --- CLAUDE.md 読み込み ---

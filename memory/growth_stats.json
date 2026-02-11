@@ -1,11 +1,35 @@
 {
-  "total_attempts": 0,
+  "total_attempts": 1,
   "total_successes": 0,
-  "total_failures": 0,
+  "total_failures": 1,
   "success_rate": 0.0,
-  "failure_reasons": {"syntax_error": 0, "timeout": 0, "test_fail": 0, "duplicate": 0},
-  "modules_improved": {"brain.py": 0, "growth.py": 0, "god.py": 0, "memory.py": 0, "config.py": 0, "jobqueue.py": 0},
+  "failure_reasons": {
+    "syntax_error": 0,
+    "timeout": 0,
+    "test_fail": 0,
+    "duplicate": 1,
+    "rollback": 0
+  },
+  "modules_improved": {
+    "brain.py": 0,
+    "growth.py": 0,
+    "god.py": 0,
+    "memory.py": 0,
+    "config.py": 0,
+    "jobqueue.py": 0
+  },
   "avg_improvement_time": 0,
-  "last_10_results": [],
-  "streak": {"current_success": 0, "best_success": 0}
+  "last_10_results": [
+    {
+      "time": "2026-02-12T02:50:21.783748",
+      "success": false,
+      "module": "unknown",
+      "failure_reason": "duplicate",
+      "duration": 0
+    }
+  ],
+  "streak": {
+    "current_success": 0,
+    "best_success": 0
+  }
 }

@@ -23,7 +23,7 @@ from memory import (
 )
 from brain import think, is_heavy, get_brain_counts
 from jobqueue import get_job_queue, job_worker, format_queue_status, init_job_queue
-from growth import reflection_cycle, reflection_scheduler, self_growth_scheduler, is_reflecting, get_stats_summary
+from growth import reflection_cycle, reflection_scheduler, self_growth_scheduler, is_reflecting, get_stats_summary, get_auto_suggestions
 
 # --- PIDファイルによる重複プロセス防止 ---
 def check_single_instance():
@@ -149,7 +149,16 @@ def _handle_stats_command() -> str:
     """成長統計を表示"""
     try:
         summary = get_stats_summary()
-        return f"📊 成長統計\n{summary}"
+        suggestions = get_auto_suggestions()
+
+        result = f"📊 成長統計\n{summary}"
+
+        if suggestions:
+            result += "\n\n💡 自動提案:\n"
+            for i, suggestion in enumerate(suggestions, 1):
+                result += f"{i}. {suggestion}\n"
+
+        return result
     except Exception as e:
         log.error(f"統計取得エラー: {e}")
         return f"統計取得エラー: {e}"
