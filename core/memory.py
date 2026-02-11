@@ -106,12 +106,20 @@ def save_conversations(convos: list):
 
     # アーカイブは最新500件まで保持
     if len(archive) > 500:
+        # 効率化のため、スライシングで保持する件数を減らす
         archive = archive[-500:]
-    save_conversations_archive(archive)
+    try:
+        save_conversations_archive(archive)
+    except Exception as e:
+        log.error(f"Failed to save conversations archive: {e}")
+        # アーカイブ保存失敗時も、最新の会話は保存を試みる
 
     # 最新50件のみ保持
     convos = convos[-50:]
-    CONVERSATIONS_PATH.write_text(json.dumps(convos, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        CONVERSATIONS_PATH.write_text(json.dumps(convos, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.error(f"Failed to save current conversations: {e}")
 
 # --- Identity読み込み ---
 def load_identity() -> str:
