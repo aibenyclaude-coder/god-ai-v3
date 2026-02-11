@@ -33,7 +33,7 @@ from memory import (
     load_state, save_state, read_file, append_journal,
     safe_save_state, safe_append_journal
 )
-from brain import think_gemini, think_claude_heavy
+from brain import think_gemini, think_claude
 from jobqueue import Priority, create_job
 
 # --- CLAUDE.md パス ---
@@ -49,7 +49,25 @@ MODULE_PATHS = {
     "jobqueue": CORE_DIR / "jobqueue.py",
     "handoff": CORE_DIR / "handoff.py",
     "gdrive": CORE_DIR / "gdrive.py",
+    "twitter": CORE_DIR / "twitter.py",
 }
+
+# 有効なモジュール名のセット（存在チェック用）
+VALID_MODULES = set(MODULE_PATHS.keys())
+
+# 有効なファイル名のセット（.py付き）
+VALID_MODULE_FILES = {f"{name}.py" for name in VALID_MODULES}
+
+def _detect_invalid_module_names(text: str) -> list[str]:
+    """テキスト内の無効なモジュール名を検出。戻り値: 無効なファイル名のリスト"""
+    import re
+    # .pyで終わる単語を抽出
+    potential_files = re.findall(r'\b(\w+\.py)\b', text)
+    invalid = []
+    for f in potential_files:
+        if f not in VALID_MODULE_FILES and f != "__init__.py":
+            invalid.append(f)
+    return list(set(invalid))  # 重複除去
 
 # --- 振り返り排他制御 ---
 _reflecting = False
@@ -457,25 +475,43 @@ def _generate_claude_md_content(
 
 
 # --- 改善対象モジュールの自動選択 ---
-def select_target_module(improvement_text: str) -> tuple[Path, str]:
-    """改善内容から対象モジュールを自動選択。戻り値: (モジュールパス, モジュール名)"""
+def select_target_module(improvement_text: str) -> tuple[Path, str] | None:
+    """改善内容から対象モジュールを自動選択。戻り値: (モジュールパス, モジュール名) or None（無効な場合）"""
     improvement_lower = improvement_text.lower()
+
+    # キーワードマッチングでモジュール選択
     if any(kw in improvement_lower for kw in ["振り返り", "reflection", "自己改善", "growth", "improve"]):
-        return (MODULE_PATHS["growth"], "growth")
-    elif any(kw in improvement_lower for kw in ["gemini", "claude", "think", "脳", "brain", "ai"]):
-        return (MODULE_PATHS["brain"], "brain")
+        module_name = "growth"
+    elif any(kw in improvement_lower for kw in ["gemini", "claude", "think", "脳", "brain", "ai", "timeout"]):
+        module_name = "brain"
     elif any(kw in improvement_lower for kw in ["memory", "state", "journal", "保存", "読み込み"]):
-        return (MODULE_PATHS["memory"], "memory")
+        module_name = "memory"
     elif any(kw in improvement_lower for kw in ["queue", "job", "キュー", "priority"]):
-        return (MODULE_PATHS["jobqueue"], "jobqueue")
+        module_name = "jobqueue"
     elif any(kw in improvement_lower for kw in ["config", "設定", "定数", "env"]):
-        return (MODULE_PATHS["config"], "config")
+        module_name = "config"
     elif any(kw in improvement_lower for kw in ["handoff", "引き継ぎ"]):
-        return (MODULE_PATHS["handoff"], "handoff")
+        module_name = "handoff"
     elif any(kw in improvement_lower for kw in ["drive", "google", "upload", "backup"]):
-        return (MODULE_PATHS["gdrive"], "gdrive")
+        module_name = "gdrive"
+    elif any(kw in improvement_lower for kw in ["twitter", "tweet", "ツイート", "x連携"]):
+        module_name = "twitter"
+    elif any(kw in improvement_lower for kw in ["telegram", "polling", "メイン", "main", "god"]):
+        module_name = "god"
     else:
-        return (MODULE_PATHS["god"], "god")
+        module_name = "god"  # デフォルト
+
+    # 存在チェック
+    if module_name not in VALID_MODULES:
+        log.warning(f"無効なモジュール名: {module_name}")
+        return None
+
+    module_path = MODULE_PATHS[module_name]
+    if not module_path.exists():
+        log.warning(f"モジュールファイルが存在しない: {module_path}")
+        return None
+
+    return (module_path, module_name)
 
 
 # --- バックアップ管理 ---
@@ -761,6 +797,76 @@ def validate_code_syntax(code: str) -> tuple[bool, str]:
     except Exception as e:
         return (False, f"Unexpected error: {e}")
 
+# --- 差分パッチ適用関数 ---
+def parse_patches(result_text: str) -> list[tuple[str, str]]:
+    """AI生成結果から<<<BEFORE>>><<<AFTER>>><<<END>>>形式のパッチを抽出。
+    戻り値: [(before_code, after_code), ...]
+    """
+    patches = []
+    parts = result_text.split("<<<BEFORE>>>")
+    for part in parts[1:]:  # 最初の空要素をスキップ
+        if "<<<AFTER>>>" not in part or "<<<END>>>" not in part:
+            continue
+        before_section, rest = part.split("<<<AFTER>>>", 1)
+        after_section = rest.split("<<<END>>>", 1)[0]
+        before_code = before_section.strip()
+        after_code = after_section.strip()
+        if before_code:  # 空のパッチはスキップ
+            patches.append((before_code, after_code))
+    return patches
+
+
+def apply_patches(module_path: Path, patches: list[tuple[str, str]]) -> tuple[bool, str, str]:
+    """差分パッチをモジュールに適用。
+
+    Args:
+        module_path: 対象モジュールのパス
+        patches: [(before_code, after_code), ...] のリスト
+
+    Returns:
+        (成功かどうか, 適用後コード, エラーメッセージ)
+    """
+    code = module_path.read_text(encoding="utf-8")
+    original_code = code
+    applied_count = 0
+
+    for i, (before, after) in enumerate(patches):
+        if before in code:
+            code = code.replace(before, after, 1)
+            applied_count += 1
+            log.info(f"パッチ {i+1}/{len(patches)} 適用成功")
+        else:
+            # 改行・空白の微妙な差異に対応: 前後の空白をnormalizeして再試行
+            before_normalized = "\n".join(line.rstrip() for line in before.splitlines())
+            code_normalized = "\n".join(line.rstrip() for line in code.splitlines())
+            if before_normalized in code_normalized:
+                # normalized版で位置を特定し、元のコードで置換
+                idx = code_normalized.find(before_normalized)
+                # 元のコードでの対応位置を計算
+                original_lines = code.splitlines(keepends=True)
+                norm_lines = code_normalized.splitlines(keepends=True)
+                # 行単位で対応
+                before_line_count = len(before_normalized.splitlines())
+                norm_pos = code_normalized[:idx].count("\n")
+                # 元コードの該当行を置換
+                orig_lines = code.splitlines(keepends=True)
+                before_lines = orig_lines[norm_pos:norm_pos + before_line_count]
+                before_original = "".join(before_lines)
+                code = code.replace(before_original, after + "\n" if not after.endswith("\n") else after, 1)
+                applied_count += 1
+                log.info(f"パッチ {i+1}/{len(patches)} 適用成功（normalized match）")
+            else:
+                error_msg = f"パッチ {i+1}/{len(patches)} 適用失敗: BEFORE部分がコード内に見つかりません\nBEFORE先頭: {before[:100]}"
+                log.error(error_msg)
+                return (False, original_code, error_msg)
+
+    if applied_count == 0:
+        return (False, original_code, "適用されたパッチがありません")
+
+    log.info(f"全{applied_count}件のパッチ適用完了")
+    return (True, code, "")
+
+
 # --- 改善履歴管理関数 ---
 def load_improvement_history() -> dict:
     """改善履歴を読み込む"""
@@ -793,17 +899,21 @@ def get_improvement_hash(improvement_text: str) -> str:
     return hashlib.md5(normalized.encode('utf-8')).hexdigest()[:12]
 
 
-def record_improvement(improvement_text: str, result: str):
+def record_improvement(improvement_text: str, status: str):
     """改善提案を履歴に記録
 
     Args:
         improvement_text: 改善内容のテキスト
-        result: "success" or "failure" or "skipped"
+        status: "proposed" / "success" / "failed" / "skipped"
+            - proposed: 提案されたが未実行
+            - success: 実行して成功
+            - failed: 実行して失敗
+            - skipped: 3回以上失敗してスキップ対象に
     """
     history = load_improvement_history()
     proposal_hash = get_improvement_hash(improvement_text)
 
-    # 既存のエントリを更新、なければ追加
+    # 既存のエントリを検索
     existing = None
     for p in history["proposals"]:
         if p["hash"] == proposal_hash:
@@ -812,17 +922,32 @@ def record_improvement(improvement_text: str, result: str):
 
     now = datetime.now(timezone.utc).isoformat()
     if existing:
-        existing["result"] = result
+        old_status = existing.get("status", existing.get("result", "unknown"))
+        existing["status"] = status
         existing["timestamp"] = now
+
+        # 失敗回数をトラック
+        if status == "failed":
+            existing["fail_count"] = existing.get("fail_count", 0) + 1
+            # 3回以上失敗したらskippedに変更
+            if existing["fail_count"] >= 3:
+                existing["status"] = "skipped"
+                log.warning(f"改善提案が3回以上失敗、skippedに変更: {proposal_hash}")
+        elif status == "success":
+            existing["fail_count"] = 0  # 成功したらリセット
+
         existing["attempt_count"] = existing.get("attempt_count", 0) + 1
+        log.info(f"改善履歴更新: hash={proposal_hash}, {old_status} -> {existing['status']}")
     else:
         history["proposals"].append({
             "hash": proposal_hash,
             "content_preview": improvement_text[:100],
-            "result": result,
+            "status": status,
             "timestamp": now,
-            "attempt_count": 1
+            "attempt_count": 1,
+            "fail_count": 1 if status == "failed" else 0
         })
+        log.info(f"改善履歴新規記録: hash={proposal_hash}, status={status}")
 
     # 古いエントリを削除（90日以上前）
     cutoff = datetime.now(timezone.utc).timestamp() - (90 * 24 * 60 * 60)
@@ -832,75 +957,132 @@ def record_improvement(improvement_text: str, result: str):
     ]
 
     save_improvement_history(history)
-    log.info(f"改善履歴記録: hash={proposal_hash}, result={result}")
 
 
 def is_duplicate_improvement(improvement_text: str) -> tuple[bool, str]:
-    """改善提案が重複しているかチェック（30日以内の同一提案をスキップ）
+    """改善提案が重複しているかチェック
+
+    status-based チェック:
+    - "success": スキップ（既に成功した改善は再実行不要）
+    - "skipped": スキップ（3回以上失敗した提案）
+    - "proposed": 再挑戦を許可（提案されたが実行されなかった）
+    - "failed": 再挑戦を許可（失敗したが3回未満）
 
     Returns:
-        (重複かどうか, 理由メッセージ)
+        (スキップすべきか, 理由メッセージ)
     """
     history = load_improvement_history()
     proposal_hash = get_improvement_hash(improvement_text)
 
-    # 30日以内に同じハッシュの提案があるかチェック
-    cutoff = datetime.now(timezone.utc).timestamp() - (30 * 24 * 60 * 60)
-
     for p in history["proposals"]:
         if p["hash"] == proposal_hash:
-            try:
-                proposal_time = datetime.fromisoformat(p["timestamp"].replace("Z", "+00:00")).timestamp()
-                if proposal_time > cutoff:
-                    days_ago = int((datetime.now(timezone.utc).timestamp() - proposal_time) / (24 * 60 * 60))
-                    return (True, f"同一提案が{days_ago}日前に実行済み (結果: {p['result']})")
-            except Exception as e:
-                log.warning(f"履歴チェックエラー: {e}")
+            status = p.get("status", p.get("result", "unknown"))
+            fail_count = p.get("fail_count", 0)
+
+            # 成功済みはスキップ
+            if status == "success":
+                return (True, f"同一提案が成功済み（スキップ）")
+
+            # 3回以上失敗（skipped）もスキップ
+            if status == "skipped":
+                return (True, f"同一提案が{fail_count}回失敗してスキップ対象")
+
+            # proposed（提案のみ）は再挑戦を許可
+            if status == "proposed":
+                log.info(f"未実行の提案を再挑戦: hash={proposal_hash}")
+                return (False, "")
+
+            # failed（失敗）は3回未満なら再挑戦を許可
+            if status == "failed":
+                if fail_count < 3:
+                    log.info(f"失敗した提案を再挑戦（{fail_count}回目）: hash={proposal_hash}")
+                    return (False, "")
+                else:
+                    return (True, f"同一提案が{fail_count}回失敗してスキップ対象")
 
     return (False, "")
 
 
-# --- journal解析: 重複改善提案チェック ---
-def check_duplicate_improvements(journal_text: str, improvement_text: str) -> bool:
-    """直近3回のjournal振り返り履歴 + improvement_history.json から重複チェック"""
-    # 1. improvement_history.jsonで30日以内の重複をチェック
-    is_dup, reason = is_duplicate_improvement(improvement_text)
-    if is_dup:
-        log.info(f"改善履歴で重複検出: {reason}")
-        return True
+# --- 重複改善提案チェック（status-basedのみ） ---
+# 注: 旧 check_duplicate_improvements は削除。status-based の is_duplicate_improvement のみ使用
 
-    # 2. journal内の直近3回の振り返りからもチェック（従来のロジック）
-    lines = journal_text.splitlines()
-    reflections = []
-    current_reflection = []
+# --- journal圧縮関数 ---
+def compress_journal_for_reflection(journal_text: str, max_chars: int = 2500) -> str:
+    """振り返り用にjournalを圧縮する。
 
-    for line in lines:
-        if line.startswith("###") and "振り返り" in line:
-            if current_reflection:
-                reflections.append("\n".join(current_reflection))
-            current_reflection = [line]
-        elif current_reflection:
-            current_reflection.append(line)
+    (1) journalを「### 」区切りでエントリ分割
+    (2) 連続する「振り返り失敗」エントリを1行に集約
+    (3) 直近2エントリのみ全文保持、それ以前は###タイトル行のみ保持
+    (4) max_chars以内に収める
+    """
+    if not journal_text or not journal_text.strip():
+        return journal_text
 
-    if current_reflection:
-        reflections.append("\n".join(current_reflection))
+    # ### 区切りでエントリ分割
+    entries = []
+    current_entry = []
+    for line in journal_text.splitlines():
+        if line.startswith("### ") and current_entry:
+            entries.append("\n".join(current_entry))
+            current_entry = [line]
+        else:
+            current_entry.append(line)
+    if current_entry:
+        entries.append("\n".join(current_entry))
 
-    # 直近3回の振り返りから CODE_IMPROVEMENT を抽出
-    recent_improvements = []
-    for refl in reflections[-3:]:
-        for line in refl.splitlines():
-            if "CODE_IMPROVEMENT:" in line:
-                improvement = line.split("CODE_IMPROVEMENT:", 1)[1].strip()
-                recent_improvements.append(improvement)
+    # ### で始まらないヘッダ部分を分離
+    header_entries = []
+    body_entries = []
+    for entry in entries:
+        if entry.strip().startswith("### "):
+            body_entries.append(entry)
+        else:
+            header_entries.append(entry)
 
-    # 類似度チェック
-    improvement_words = set(improvement_text.lower().split())
-    for past_imp in recent_improvements:
-        past_words = set(past_imp.lower().split())
-        if len(improvement_words & past_words) / max(len(improvement_words), 1) > 0.5:
-            return True
+    if not body_entries:
+        return journal_text[:max_chars]
 
-    return False
+    # 連続する「振り返り失敗」エントリを集約
+    compressed_entries = []
+    fail_streak = []
+    for entry in body_entries:
+        first_line = entry.splitlines()[0] if entry.splitlines() else ""
+        if "振り返り失敗" in first_line:
+            # 時刻を抽出
+            time_match = re.search(r'(\d{1,2}:\d{2})', first_line)
+            fail_time = time_match.group(1) if time_match else "??:??"
+            fail_streak.append(fail_time)
+        else:
+            if fail_streak:
+                compressed_entries.append(f"### 振り返り失敗×{len(fail_streak)}回(最終: {fail_streak[-1]})")
+                fail_streak = []
+            compressed_entries.append(entry)
+    if fail_streak:
+        compressed_entries.append(f"### 振り返り失敗×{len(fail_streak)}回(最終: {fail_streak[-1]})")
+
+    if not compressed_entries:
+        return journal_text[:max_chars]
+
+    # 直近2エントリは全文保持、それ以前は###タイトル行のみ
+    if len(compressed_entries) <= 2:
+        result_entries = compressed_entries
+    else:
+        old_entries = compressed_entries[:-2]
+        recent_entries = compressed_entries[-2:]
+        title_only = []
+        for entry in old_entries:
+            first_line = entry.splitlines()[0] if entry.splitlines() else entry
+            title_only.append(first_line)
+        result_entries = title_only + recent_entries
+
+    result = "\n".join(result_entries)
+
+    # max_chars制限
+    if len(result) > max_chars:
+        result = result[-max_chars:]
+
+    return result
+
 
 # --- Google Driveバックアップ ---
 async def _drive_backup_silent():
@@ -937,30 +1119,41 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient) -> str:
     state = load_state()
     journal_tail = read_file(JOURNAL_PATH, tail=50)
 
+    # journalを圧縮してプロンプトサイズを削減
+    journal_compressed = compress_journal_for_reflection(journal_tail, max_chars=2500)
+
+    # 有効なモジュール一覧を生成
+    valid_module_list = ", ".join([f"{name}.py" for name in VALID_MODULES])
+
     prompt = f"""あなたはGod AI。自律型AIとして振り返りを行え。
 
 【現在の状態】
 {json.dumps(state, ensure_ascii=False)}
 
 【最近のjournal】
-{journal_tail}
+{journal_compressed}
+
+【対象モジュール一覧】（これ以外のファイル名を提案するな）
+{valid_module_list}
 
 【タスク】
 以下の4つに答えろ：
 1. 今日何をした？
 2. 何が問題だった？
 3. 次に何をすべき？
-4. 自分のコードに改善点はあるか？（具体的に）
+4. 自分のコードに改善点はあるか？（具体的に、上記モジュール一覧のファイルのみ対象）
 
 簡潔に日本語で答えろ。
-コードの改善点がある場合は「CODE_IMPROVEMENT:」で始まる行に具体的な修正内容を書け。"""
+コードの改善点がある場合は「CODE_IMPROVEMENT:」で始まる行に具体的な修正内容を書け。
+【重要】存在しないファイル（self_growth.py等）を提案してはならない。"""
 
     try:
         reflection, brain_name = await think_gemini(prompt)
     except Exception as e:
         log.error(f"Reflection failed: {e}")
-        append_journal(f"### {datetime.now().strftime('%H:%M')} 振り返り失敗\n{e}")
-        return ""
+        error_msg = f"振り返り失敗: {e}"
+        await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} {error_msg}")
+        return error_msg
 
     # journalに追記
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -983,16 +1176,28 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient) -> str:
 
         if improvements:
             improvement_text = "\n".join(improvements)
-            journal_full = read_file(JOURNAL_PATH)
 
-            if check_duplicate_improvements(journal_full, improvement_text):
-                log.info("重複した改善提案を検出。自己改善をスキップします。")
-                # 重複検出も統計に記録
-                update_growth_stats(success=False, failure_reason="duplicate", module="unknown", duration=0)
-                skip_msg = f"### {now} 自己改善スキップ（重複検出）\n改善内容: {improvement_text}"
+            # 無効なファイル名チェック（存在しないモジュールを提案していないか）
+            invalid_files = _detect_invalid_module_names(improvement_text)
+            if invalid_files:
+                log.warning(f"無効なファイル名を検出: {invalid_files}")
+                skip_msg = f"### {now} 自己改善スキップ（無効なファイル名）\n無効: {invalid_files}\n提案: {improvement_text[:200]}"
                 await safe_append_journal(skip_msg)
-                await tg_send(client, f"重複した改善提案を検出。既に適用済みの可能性が高いためスキップしました。\n提案: {improvement_text[:200]}")
+                await tg_send(client, f"自己改善スキップ: 存在しないファイル名を検出 ({', '.join(invalid_files)})")
+                return reflection
+
+            # status-based 重複チェック（successとskippedのみスキップ）
+            is_dup, dup_reason = is_duplicate_improvement(improvement_text)
+            if is_dup:
+                log.info(f"重複チェック: {dup_reason}")
+                update_growth_stats(success=False, failure_reason="duplicate", module="unknown", duration=0)
+                skip_msg = f"### {now} 自己改善スキップ（{dup_reason}）\n改善内容: {improvement_text}"
+                await safe_append_journal(skip_msg)
+                await tg_send(client, f"自己改善スキップ: {dup_reason}\n提案: {improvement_text[:200]}")
             else:
+                # 提案段階で "proposed" を記録（まだ実行前）
+                record_improvement(improvement_text, "proposed")
+                log.info(f"改善提案を記録 (status=proposed): {improvement_text[:50]}")
                 await self_improve(client, reflection)
 
     # CLAUDE.md自動更新
@@ -1021,7 +1226,13 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
     improvement_text = "\n".join(improvements)
 
     # 改善対象モジュールを自動選択
-    target_path, target_name = select_target_module(improvement_text)
+    result = select_target_module(improvement_text)
+    if result is None:
+        log.warning("無効な改善対象モジュールのためスキップ")
+        await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} 自己改善スキップ（無効なモジュール）")
+        await tg_send(client, "自己改善スキップ: 無効な対象モジュール")
+        return
+    target_path, target_name = result
     log.info(f"改善対象モジュール: {target_name} ({target_path})")
 
     # 統計に基づくスキップ判定
@@ -1057,11 +1268,11 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 "【プロジェクト情報（CLAUDE.md要約）】\n"
                 f"{claude_md_summary}\n\n"
                 "【重要なルール】\n"
-                "- 修正後のPythonコード全文をそのまま出力してください\n"
-                "- 説明文は一切不要です。Pythonコードのみを出力してください\n"
-                "- マークダウンのバッククォート（```）で囲まないでください\n"
-                "- コードの先頭は #!/usr/bin/env python3 から始めてください\n"
-                "- 変更箇所以外は絶対にそのまま維持してください\n"
+                "- 全コードを出力するな。変更箇所のみ以下の形式で出力しろ：\n"
+                "<<<BEFORE>>>\n変更前のコード（前後3行含む）\n<<<AFTER>>>\n変更後のコード\n<<<END>>>\n"
+                "- 複数箇所ある場合は<<<BEFORE>>><<<AFTER>>><<<END>>>を繰り返す\n"
+                "- 説明文は一切不要。パッチのみを出力\n"
+                "- インデントや空白を正確に維持すること\n"
                 "- 文字列リテラルのクォートの対応に注意してください\n"
                 f"【改善内容】\n{improvement_text}\n\n"
                 f"【対象モジュール】{target_name}.py\n\n"
@@ -1070,50 +1281,47 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
         else:
             prompt = (
                 "あなたはPythonコードの修正を行うアシスタントです。\n"
-                f"前回の修正で構文エラーが発生しました: {last_error}\n\n"
+                f"前回の修正でエラーが発生しました: {last_error}\n\n"
                 "【重要なルール】\n"
-                "- 修正後のPythonコード全文をそのまま出力してください\n"
-                "- 説明文は一切不要です。Pythonコードのみを出力してください\n"
-                "- マークダウンのバッククォート（```）で囲まないでください\n"
-                "- コードの先頭は #!/usr/bin/env python3 から始めてください\n"
-                "- 変更箇所以外は絶対にそのまま維持してください\n"
+                "- 全コードを出力するな。変更箇所のみ以下の形式で出力しろ：\n"
+                "<<<BEFORE>>>\n変更前のコード（前後3行含む）\n<<<AFTER>>>\n変更後のコード\n<<<END>>>\n"
+                "- 複数箇所ある場合は<<<BEFORE>>><<<AFTER>>><<<END>>>を繰り返す\n"
+                "- 説明文は一切不要。パッチのみを出力\n"
+                "- インデントや空白を正確に維持すること\n"
                 f"【改善内容】\n{improvement_text}\n\n"
                 f"【対象モジュール】{target_name}.py\n\n"
                 f"【現在のコード（オリジナル）】\n{current_code}"
             )
 
         try:
-            result, _ = await think_claude_heavy(prompt)
+            # Gemini優先、失敗時Claude CLIにフォールバック
+            brain_used = ""
+            try:
+                result, brain_used = await think_gemini(prompt, max_tokens=8192)
+                log.info(f"試行{attempt}: Geminiでコード生成成功（{brain_used}）")
+            except Exception as gemini_err:
+                log.warning(f"試行{attempt}: Gemini失敗 ({gemini_err})、Claude CLIにフォールバック")
+                result, brain_used = await think_claude(prompt, timeout=280)  # コード生成は長めに
+                log.info(f"試行{attempt}: Claude CLIでコード生成成功")
 
-            log.info(f"試行{attempt}: Claude生成結果（先頭200文字）: {result[:200]}")
-            log.info(f"試行{attempt}: Claude生成結果の長さ: {len(result)}文字")
+            log.info(f"試行{attempt}: {brain_used}生成結果（先頭200文字）: {result[:200]}")
+            log.info(f"試行{attempt}: {brain_used}生成結果の長さ: {len(result)}文字")
 
-            # コードブロック抽出
-            code = result.strip()
-            if code.startswith("```"):
-                if code.startswith("```python"):
-                    code = code[len("```python"):]
-                else:
-                    code = code[3:]
-                if code.rstrip().endswith("```"):
-                    code = code.rstrip()[:-3]
-                code = code.strip()
+            # パッチ抽出・適用
+            patches = parse_patches(result)
+            if not patches:
+                log.error(f"試行{attempt}: パッチが抽出できませんでした")
+                raise ValueError("パッチ形式（<<<BEFORE>>><<<AFTER>>><<<END>>>）が見つかりません")
 
-            log.info(f"試行{attempt}: 抽出後コードの長さ: {len(code)}文字（元: {len(current_code)}文字）")
+            log.info(f"試行{attempt}: {len(patches)}件のパッチを抽出")
 
-            # 基本的なバリデーション
-            if not code.startswith(("#!/", "from __future__", '"""', "import", "#")):
-                log.warning(f"試行{attempt}: コードが想定外の開始: {code[:50]}")
+            # パッチ適用
+            patch_ok, code, patch_error = apply_patches(target_path, patches)
+            if not patch_ok:
+                log.error(f"試行{attempt}: パッチ適用失敗: {patch_error}")
+                raise ValueError(f"パッチ適用失敗: {patch_error}")
 
-            # 長さチェック
-            min_length = int(len(current_code) * 0.3)
-            if len(code) < min_length:
-                new_lines = code.splitlines()
-                diff = list(difflib.unified_diff(current_lines, new_lines, lineterm="", n=3))
-                diff_str = "\n".join(diff[:50])
-                log.error(f"試行{attempt}: コードが短すぎる。元: {len(current_code)}字, 生成: {len(code)}字")
-                log.error(f"試行{attempt}: 差分:\n{diff_str}")
-                raise ValueError(f"生成コードが短すぎる（元: {len(current_code)}字, 生成: {len(code)}字）")
+            log.info(f"試行{attempt}: パッチ適用後コードの長さ: {len(code)}文字（元: {len(current_code)}文字）")
 
             # 構文チェック
             is_valid, syntax_error_msg = validate_code_syntax(code)
@@ -1150,7 +1358,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 record_improvement(improvement_text, "success")
 
                 success_msg = f"自己改善成功（試行{attempt}/{MAX_RETRY}）\n対象: {target_name}.py\n改善内容: {improvement_text}"
-                append_journal(
+                await safe_append_journal(
                     f"### {datetime.now().strftime('%H:%M')} {success_msg}\n"
                     f"コード長: {len(current_code)} -> {len(code)}文字\n"
                     f"```diff\n{diff_for_journal}\n```\n"
@@ -1188,7 +1396,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                     duration = time_module.time() - start_time
                     update_growth_stats(success=False, failure_reason="test_fail", module=target_name, duration=duration)
 
-                append_journal(
+                await safe_append_journal(
                     f"### {datetime.now().strftime('%H:%M')} 自己改善 試行{attempt}/{MAX_RETRY} テスト失敗でロールバック\n"
                     f"❌ {failed_test_name}\n{test_result}\n改善内容: {improvement_text}"
                 )
@@ -1206,7 +1414,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 duration = time_module.time() - start_time
                 update_growth_stats(success=False, failure_reason="syntax_error", module=target_name, duration=duration)
 
-            append_journal(
+            await safe_append_journal(
                 f"### {datetime.now().strftime('%H:%M')} 自己改善 試行{attempt}/{MAX_RETRY} 失敗\n"
                 f"エラー: {e}\n改善内容: {improvement_text}"
             )
@@ -1222,7 +1430,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
             duration = time_module.time() - start_time
             update_growth_stats(success=False, failure_reason="timeout", module=target_name, duration=duration)
 
-            append_journal(
+            await safe_append_journal(
                 f"### {datetime.now().strftime('%H:%M')} 自己改善 試行{attempt}/{MAX_RETRY} 予期せぬエラー\n"
                 f"エラー: {e}\n改善内容: {improvement_text}"
             )
@@ -1230,6 +1438,10 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
 
     # 全試行失敗 -> ロールバック
     shutil.copy2(backup_path, target_path)
+
+    # 失敗をステータスに記録（3回失敗するとskippedに自動変更される）
+    record_improvement(improvement_text, "failed")
+
     fail_msg = (
         f"自己改善 {MAX_RETRY}回試行して失敗。ロールバックしました。\n"
         f"対象: {target_name}.py\n"
@@ -1237,7 +1449,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
         f"改善内容: {improvement_text}"
     )
     log.error(fail_msg)
-    append_journal(f"### {datetime.now().strftime('%H:%M')} {fail_msg}")
+    await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} {fail_msg}")
     await tg_send(
         client,
         f"自己改善 {MAX_RETRY}回失敗。ロールバックしました。\n"
@@ -1261,7 +1473,7 @@ async def reflection_scheduler(client: httpx.AsyncClient):
             await tg_send(client, f"定期振り返り開始... (次回: {REFLECTION_INTERVAL}秒後)")
             executed, result = await reflection_cycle(client)
             if executed:
-                summary = result[:200] + "..." if len(result) > 200 else result
+                summary = result[:1000] + "..." if len(result) > 1000 else result
                 await tg_send(client, f"定期振り返り完了。\n\n{summary}")
                 log.info("定期振り返り: 完了")
             else:
@@ -1271,7 +1483,7 @@ async def reflection_scheduler(client: httpx.AsyncClient):
             raise
         except Exception as e:
             log.error(f"Scheduled reflection failed: {e}", exc_info=True)
-            append_journal(f"### {datetime.now().strftime('%H:%M')} 定期振り返りエラー\n{e}")
+            await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} 定期振り返りエラー\n{e}")
             await asyncio.sleep(10)
 
 # --- 自己成長提案ジョブ ---
