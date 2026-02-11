@@ -21,7 +21,7 @@ from memory import (
     load_state, save_state, load_conversations, save_conversations,
     append_journal, read_file, load_identity, init_write_lock
 )
-from brain import think, is_heavy, get_brain_counts
+from brain import think, is_heavy, get_brain_counts, detect_action_intent
 from jobqueue import get_job_queue, job_worker, format_queue_status, init_job_queue
 from growth import reflection_cycle, reflection_scheduler, self_growth_scheduler, is_reflecting, get_stats_summary, get_auto_suggestions
 
@@ -95,8 +95,24 @@ async def handle_message(client: httpx.AsyncClient, message: str) -> str:
     if append_match:
         return _handle_file_append(append_match.group(1), append_match.group(2))
 
+    # アクション意図を検出
+    action_intent = detect_action_intent(message)
     heavy = is_heavy(message)
     identity = load_identity()
+
+    # アクション意図に応じてプロンプトを調整
+    action_guidance = ""
+    if action_intent["needs_action"]:
+        action_guidance = f"""
+【検出されたアクション意図】
+- アクション種類: {action_intent["action_type"]}
+- 対象: {action_intent["target"]}
+- 注意: 実際にアクションが必要です。単なる説明ではなく、具体的な操作を実行してください。"""
+    else:
+        action_guidance = """
+【注意】
+質問・説明のリクエストとして検出されました。情報提供で応答してください。"""
+
     system_prompt = f"""あなたはGod AI。Benyのために存在する自律型AI。
 
 【アイデンティティ】
@@ -104,6 +120,7 @@ async def handle_message(client: httpx.AsyncClient, message: str) -> str:
 
 【現在の状態】
 {json.dumps(state, ensure_ascii=False)}
+{action_guidance}
 
 【Benyからのメッセージ】
 {message}
@@ -279,8 +296,28 @@ def notify_fatal_error(message: str):
     except Exception:
         pass
 
+# --- ログローテーション ---
+def rotate_logs():
+    """起動時にログファイルをローテーション（最大3世代）"""
+    import shutil
+    log_path = Path("/tmp/godai_v3.log")
+    if log_path.exists():
+        # 既存ログをローテーション
+        for i in range(2, 0, -1):
+            old = Path(f"/tmp/godai_v3.log.{i}")
+            new = Path(f"/tmp/godai_v3.log.{i+1}")
+            if old.exists():
+                if i == 2:
+                    old.unlink()  # 3世代目は削除
+                else:
+                    shutil.move(old, new)
+        shutil.move(log_path, Path("/tmp/godai_v3.log.1"))
+        log.info("ログローテーション完了")
+
+
 # --- メイン ---
 async def main():
+    rotate_logs()
     init_write_lock()
     init_job_queue()
     check_single_instance()

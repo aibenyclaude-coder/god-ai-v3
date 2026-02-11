@@ -612,9 +612,115 @@ def validate_code_syntax(code: str) -> tuple[bool, str]:
     except Exception as e:
         return (False, f"Unexpected error: {e}")
 
+# --- 改善履歴管理関数 ---
+def load_improvement_history() -> dict:
+    """改善履歴を読み込む"""
+    default_history = {"proposals": []}
+    if IMPROVEMENT_HISTORY_PATH.exists():
+        try:
+            with open(IMPROVEMENT_HISTORY_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log.warning(f"改善履歴読み込み失敗: {e}")
+    return default_history
+
+
+def save_improvement_history(history: dict):
+    """改善履歴を保存"""
+    try:
+        with open(IMPROVEMENT_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        log.debug(f"改善履歴保存: {IMPROVEMENT_HISTORY_PATH}")
+    except Exception as e:
+        log.error(f"改善履歴保存失敗: {e}")
+
+
+def get_improvement_hash(improvement_text: str) -> str:
+    """改善提案のハッシュを生成（正規化してから）"""
+    # 正規化: 小文字化、空白を統一、記号除去
+    normalized = improvement_text.lower().strip()
+    normalized = re.sub(r'\s+', ' ', normalized)
+    normalized = re.sub(r'[^\w\s]', '', normalized)
+    return hashlib.md5(normalized.encode('utf-8')).hexdigest()[:12]
+
+
+def record_improvement(improvement_text: str, result: str):
+    """改善提案を履歴に記録
+
+    Args:
+        improvement_text: 改善内容のテキスト
+        result: "success" or "failure" or "skipped"
+    """
+    history = load_improvement_history()
+    proposal_hash = get_improvement_hash(improvement_text)
+
+    # 既存のエントリを更新、なければ追加
+    existing = None
+    for p in history["proposals"]:
+        if p["hash"] == proposal_hash:
+            existing = p
+            break
+
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        existing["result"] = result
+        existing["timestamp"] = now
+        existing["attempt_count"] = existing.get("attempt_count", 0) + 1
+    else:
+        history["proposals"].append({
+            "hash": proposal_hash,
+            "content_preview": improvement_text[:100],
+            "result": result,
+            "timestamp": now,
+            "attempt_count": 1
+        })
+
+    # 古いエントリを削除（90日以上前）
+    cutoff = datetime.now(timezone.utc).timestamp() - (90 * 24 * 60 * 60)
+    history["proposals"] = [
+        p for p in history["proposals"]
+        if datetime.fromisoformat(p["timestamp"].replace("Z", "+00:00")).timestamp() > cutoff
+    ]
+
+    save_improvement_history(history)
+    log.info(f"改善履歴記録: hash={proposal_hash}, result={result}")
+
+
+def is_duplicate_improvement(improvement_text: str) -> tuple[bool, str]:
+    """改善提案が重複しているかチェック（30日以内の同一提案をスキップ）
+
+    Returns:
+        (重複かどうか, 理由メッセージ)
+    """
+    history = load_improvement_history()
+    proposal_hash = get_improvement_hash(improvement_text)
+
+    # 30日以内に同じハッシュの提案があるかチェック
+    cutoff = datetime.now(timezone.utc).timestamp() - (30 * 24 * 60 * 60)
+
+    for p in history["proposals"]:
+        if p["hash"] == proposal_hash:
+            try:
+                proposal_time = datetime.fromisoformat(p["timestamp"].replace("Z", "+00:00")).timestamp()
+                if proposal_time > cutoff:
+                    days_ago = int((datetime.now(timezone.utc).timestamp() - proposal_time) / (24 * 60 * 60))
+                    return (True, f"同一提案が{days_ago}日前に実行済み (結果: {p['result']})")
+            except Exception as e:
+                log.warning(f"履歴チェックエラー: {e}")
+
+    return (False, "")
+
+
 # --- journal解析: 重複改善提案チェック ---
 def check_duplicate_improvements(journal_text: str, improvement_text: str) -> bool:
-    """直近3回のjournal振り返り履歴から、同一のCODE_IMPROVEMENT提案があるかチェック。"""
+    """直近3回のjournal振り返り履歴 + improvement_history.json から重複チェック"""
+    # 1. improvement_history.jsonで30日以内の重複をチェック
+    is_dup, reason = is_duplicate_improvement(improvement_text)
+    if is_dup:
+        log.info(f"改善履歴で重複検出: {reason}")
+        return True
+
+    # 2. journal内の直近3回の振り返りからもチェック（従来のロジック）
     lines = journal_text.splitlines()
     reflections = []
     current_reflection = []
@@ -888,6 +994,10 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 # 全テスト合格 -> 改善確定
                 duration = time_module.time() - start_time
                 update_growth_stats(success=True, failure_reason=None, module=target_name, duration=duration)
+
+                # 改善履歴に記録
+                record_improvement(improvement_text, "success")
+
                 success_msg = f"自己改善成功（試行{attempt}/{MAX_RETRY}）\n対象: {target_name}.py\n改善内容: {improvement_text}"
                 append_journal(
                     f"### {datetime.now().strftime('%H:%M')} {success_msg}\n"
@@ -897,6 +1007,22 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 )
                 await tg_send(client, f"[自己改善] {success_msg}\nコード長: {len(current_code)} -> {len(code)}文字\n✅ テスト全合格")
                 log.info(f"自己改善成功（試行{attempt}）: {len(current_code)} -> {len(code)}文字、テスト全合格")
+
+                # --- git自動commit ---
+                try:
+                    commit_summary = improvement_text[:50].replace('\n', ' ')
+                    subprocess.run(["git", "add", str(target_path)], cwd=str(BASE_DIR), check=True, timeout=30)
+                    subprocess.run(
+                        ["git", "commit", "-m", f"self-improve: {target_name} - {commit_summary}"],
+                        cwd=str(BASE_DIR), check=True, timeout=30
+                    )
+                    subprocess.run(["git", "push"], cwd=str(BASE_DIR), check=False, timeout=60)
+                    log.info(f"git自動commit完了: {target_name}")
+                except subprocess.CalledProcessError as e:
+                    log.warning(f"git commit失敗（変更なしの可能性）: {e}")
+                except Exception as e:
+                    log.error(f"git自動commit失敗: {e}")
+
                 return
             else:
                 # テスト失敗 -> 即ロールバック
