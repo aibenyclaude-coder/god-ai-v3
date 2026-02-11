@@ -123,7 +123,17 @@ async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
                         raise Exception("Gemini 429 rate limit exceeded after retries")
 
                 if "error" in data:
-                    raise Exception(f"Gemini API error: {data['error']}")
+                    # Gemini APIエラーの詳細をログに残す
+                    error_message = data["error"].get("message", "Unknown error")
+                    error_details = data["error"].get("details", [])
+                    log.error(f"Gemini API error (attempt {attempt+1}): {error_message} - Details: {error_details}")
+                    # エラー内容によってはフォールバックを検討（例: invalid-argumentなど）
+                    # ここでは一旦、一般的なエラーとして後続のフォールバックに任せる
+                    raise Exception(f"Gemini API error: {error_message}")
+
+                if "candidates" not in data or not data["candidates"]:
+                    log.error(f"Gemini API invalid response (attempt {attempt+1}): No candidates found. Response: {data}")
+                    raise Exception("Gemini API returned no candidates")
 
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 _gemini_count += 1
@@ -135,7 +145,7 @@ async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
                 await asyncio.sleep(retry_delay)
                 continue
             # Gemini完全失敗 → GLM-4フォールバック
-            log.error(f"Gemini failed: {e}, falling back to GLM-4")
+            log.error(f"Gemini failed (attempt {attempt+1}): {e}, falling back to GLM-4")
             try:
                 text, brain = await think_glm(prompt)
                 return (text, f"{brain} (fallback)")
