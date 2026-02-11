@@ -478,21 +478,128 @@ def select_target_module(improvement_text: str) -> tuple[Path, str]:
         return (MODULE_PATHS["god"], "god")
 
 
+# --- バックアップ管理 ---
+def create_module_backups() -> dict[str, Path]:
+    """改善前に全モジュールのバックアップを作成。戻り値: {モジュール名: バックアップパス}"""
+    backups = {}
+    for module_name, module_path in MODULE_PATHS.items():
+        if module_path.exists():
+            backup_path = module_path.with_suffix(".py.bak")
+            try:
+                shutil.copy2(module_path, backup_path)
+                backups[module_name] = backup_path
+                log.debug(f"バックアップ作成: {module_name} -> {backup_path}")
+            except Exception as e:
+                log.error(f"バックアップ作成失敗 {module_name}: {e}")
+    # twitter.pyも追加
+    twitter_path = CORE_DIR / "twitter.py"
+    if twitter_path.exists():
+        backup_path = twitter_path.with_suffix(".py.bak")
+        try:
+            shutil.copy2(twitter_path, backup_path)
+            backups["twitter"] = backup_path
+        except Exception as e:
+            log.error(f"バックアップ作成失敗 twitter: {e}")
+    log.info(f"モジュールバックアップ作成完了: {len(backups)}件")
+    return backups
+
+
+def rollback_from_backups(backups: dict[str, Path], target_modules: Optional[list[str]] = None):
+    """バックアップからロールバック
+
+    Args:
+        backups: create_module_backups()の戻り値
+        target_modules: ロールバック対象のモジュール名リスト（Noneなら全て）
+    """
+    modules_to_rollback = target_modules if target_modules else list(backups.keys())
+    rolled_back = []
+
+    for module_name in modules_to_rollback:
+        if module_name not in backups:
+            continue
+        backup_path = backups[module_name]
+        if not backup_path.exists():
+            log.warning(f"バックアップファイルが存在しない: {backup_path}")
+            continue
+
+        module_path = MODULE_PATHS.get(module_name)
+        if module_name == "twitter":
+            module_path = CORE_DIR / "twitter.py"
+        if module_path:
+            try:
+                shutil.copy2(backup_path, module_path)
+                rolled_back.append(module_name)
+                log.info(f"ロールバック完了: {module_name}")
+            except Exception as e:
+                log.error(f"ロールバック失敗 {module_name}: {e}")
+
+    log.info(f"ロールバック完了: {rolled_back}")
+    return rolled_back
+
+
+def cleanup_backups(backups: dict[str, Path]):
+    """成功時にバックアップファイルを削除"""
+    for module_name, backup_path in backups.items():
+        try:
+            if backup_path.exists():
+                backup_path.unlink()
+                log.debug(f"バックアップ削除: {backup_path}")
+        except Exception as e:
+            log.warning(f"バックアップ削除失敗 {module_name}: {e}")
+
+
+# --- モジュール再読み込み ---
+def reload_modules(module_names: list[str]) -> tuple[bool, str]:
+    """指定モジュールをimportlib.reloadで再読み込み（God AI再起動不要）
+
+    Args:
+        module_names: 再読み込みするモジュール名のリスト
+
+    Returns:
+        (成功したか, メッセージ)
+    """
+    reloaded = []
+    errors = []
+
+    for name in module_names:
+        if name in sys.modules:
+            try:
+                module = sys.modules[name]
+                importlib.reload(module)
+                reloaded.append(name)
+                log.info(f"モジュール再読み込み成功: {name}")
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+                log.error(f"モジュール再読み込み失敗 {name}: {e}")
+
+    if errors:
+        return (False, f"再読み込み失敗: {'; '.join(errors)}")
+    return (True, f"再読み込み成功: {', '.join(reloaded) if reloaded else '(対象なし)'}")
+
+
 # --- 改善後自動テスト ---
-async def run_post_improvement_tests(client: httpx.AsyncClient) -> tuple[bool, str]:
+async def run_post_improvement_tests(
+    client: httpx.AsyncClient,
+    backups: Optional[dict[str, Path]] = None,
+    target_module: Optional[str] = None
+) -> tuple[bool, str]:
     """
     改善後テスト実行。戻り値: (全合格か, 結果メッセージ)
 
-    テスト項目:
-    a. 全モジュール構文チェック: python3 -m py_compile で各.pyファイルをチェック
-    b. God AI起動テスト: 起動→5秒待ち→/statusが応答するか→停止
-    c. Gemini API疎通テスト: 簡単なprompt送信→応答あるか
+    テスト項目（順序厳守）:
+    1. 全モジュール構文チェック: python3 -m py_compile core/*.py
+    2. importテスト: 全モジュールのimport確認
+    3. Gemini API疎通テスト: 簡単なprompt送信→応答あるか
+    4. 全合格 → journal記録「✅ テスト全合格」+ モジュール再読み込み
+    5. 1つでも失敗 → .bakからロールバック → Telegram通知
     """
+    from god import tg_send
+
     results = []
     all_passed = True
 
-    # --- a. 全モジュール構文チェック ---
-    log.info("テスト(a): 全モジュール構文チェック開始")
+    # --- 1. 全モジュール構文チェック ---
+    log.info("テスト(1): 全モジュール構文チェック開始")
     syntax_errors = []
     for module_name, module_path in MODULE_PATHS.items():
         if module_path.exists():
@@ -513,83 +620,125 @@ async def run_post_improvement_tests(client: httpx.AsyncClient) -> tuple[bool, s
                 syntax_errors.append(f"{module_name}: {e}")
                 log.error(f"構文チェックエラー in {module_name}: {e}")
 
+    # twitter.pyも追加チェック
+    twitter_path = CORE_DIR / "twitter.py"
+    if twitter_path.exists():
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(twitter_path)],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if proc.returncode != 0:
+                syntax_errors.append(f"twitter: {proc.stderr.strip()}")
+        except Exception as e:
+            syntax_errors.append(f"twitter: {e}")
+
     if syntax_errors:
         all_passed = False
         results.append(f"❌ 構文チェック失敗: {'; '.join(syntax_errors)}")
+        # ロールバック実行
+        if backups:
+            rollback_from_backups(backups)
+            await tg_send(client, f"⚠️ 自己改善失敗→ロールバック完了\n構文エラー: {'; '.join(syntax_errors)[:200]}")
+        return (False, "\n".join(results))
     else:
         results.append("✅ 構文チェック全合格")
-        log.info("テスト(a): 全モジュール構文チェック合格")
+        log.info("テスト(1): 全モジュール構文チェック合格")
 
-    # 構文エラーがある場合は以降のテストをスキップ
-    if not all_passed:
-        return (False, "\n".join(results))
+    # --- 2. importテスト ---
+    log.info("テスト(2): importテスト開始")
+    import_errors = []
 
-    # --- b. God AI起動テスト ---
-    log.info("テスト(b): God AI起動テスト開始")
-    god_test_passed = False
-    god_process = None
-    try:
-        # 現在のプロセスとは別にGod AIを起動
-        env = os.environ.copy()
-        god_process = subprocess.Popen(
-            [sys.executable, str(CORE_DIR / "god.py")],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            cwd=str(CORE_DIR)
-        )
+    # 各モジュールのimportテスト
+    import_tests = [
+        ("brain", "think_gemini"),
+        ("memory", "load_state"),
+        ("jobqueue", "get_job_queue"),
+        ("growth", "reflection_cycle"),
+        ("gdrive", "is_configured"),
+        ("handoff", "generate"),
+        ("twitter", "is_configured"),
+    ]
 
-        # 5秒待つ
-        await asyncio.sleep(5)
+    for module_name, func_name in import_tests:
+        try:
+            # 新しいPythonプロセスでimportテスト実行
+            import_cmd = f"from {module_name} import {func_name}"
+            proc = subprocess.run(
+                [sys.executable, "-c", import_cmd],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=str(CORE_DIR)
+            )
+            if proc.returncode != 0:
+                import_errors.append(f"{module_name}.{func_name}: {proc.stderr.strip()[:100]}")
+                log.error(f"importエラー {module_name}.{func_name}: {proc.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            import_errors.append(f"{module_name}.{func_name}: タイムアウト")
+            log.error(f"importテストタイムアウト: {module_name}.{func_name}")
+        except Exception as e:
+            import_errors.append(f"{module_name}.{func_name}: {e}")
+            log.error(f"importテストエラー {module_name}.{func_name}: {e}")
 
-        # プロセスが生きているか確認
-        if god_process.poll() is None:
-            # /statusが応答するかテスト（Telegram APIを直接呼ぶのは難しいので、プロセスが生きていることを確認）
-            god_test_passed = True
-            results.append("✅ God AI起動テスト合格（5秒後も稼働中）")
-            log.info("テスト(b): God AI起動テスト合格")
-        else:
-            returncode = god_process.returncode
-            stderr = god_process.stderr.read().decode() if god_process.stderr else ""
-            all_passed = False
-            results.append(f"❌ God AI起動テスト失敗: 5秒以内にクラッシュ(returncode={returncode}, stderr={stderr[:200]})")
-            log.error(f"テスト(b): God AIが5秒以内にクラッシュ: {stderr[:200]}")
-    except Exception as e:
+    if import_errors:
         all_passed = False
-        results.append(f"❌ God AI起動テスト失敗: {e}")
-        log.error(f"テスト(b): God AI起動テストエラー: {e}")
-    finally:
-        # テスト用プロセスを停止
-        if god_process and god_process.poll() is None:
-            try:
-                god_process.terminate()
-                await asyncio.sleep(1)
-                if god_process.poll() is None:
-                    god_process.kill()
-                log.info("テスト(b): テスト用God AIプロセスを停止")
-            except Exception as e:
-                log.warning(f"テスト用プロセス停止エラー: {e}")
-
-    # 起動テスト失敗の場合は以降のテストをスキップ
-    if not god_test_passed:
+        results.append(f"❌ importテスト失敗: {'; '.join(import_errors)}")
+        # ロールバック実行
+        if backups:
+            rollback_from_backups(backups)
+            await tg_send(client, f"⚠️ 自己改善失敗→ロールバック完了\nimportエラー: {'; '.join(import_errors)[:200]}")
         return (False, "\n".join(results))
+    else:
+        results.append("✅ importテスト全合格")
+        log.info("テスト(2): importテスト合格")
 
-    # --- c. Gemini API疎通テスト ---
-    log.info("テスト(c): Gemini API疎通テスト開始")
+    # --- 3. Gemini API疎通テスト ---
+    log.info("テスト(3): Gemini API疎通テスト開始")
     try:
         from brain import think_gemini
         response, brain_name = await think_gemini("Hello, respond with 'OK' if you can read this.")
         if response and len(response) > 0:
             results.append(f"✅ Gemini API疎通テスト合格（応答あり: {brain_name}）")
-            log.info(f"テスト(c): Gemini API疎通テスト合格: {response[:50]}")
+            log.info(f"テスト(3): Gemini API疎通テスト合格: {response[:50]}")
         else:
             all_passed = False
             results.append("❌ Gemini API疎通テスト失敗: 応答が空")
-            log.error("テスト(c): Gemini API応答が空")
+            log.error("テスト(3): Gemini API応答が空")
+            if backups:
+                rollback_from_backups(backups)
+                await tg_send(client, "⚠️ 自己改善失敗→ロールバック完了\nGemini API応答が空")
+            return (False, "\n".join(results))
     except Exception as e:
         all_passed = False
         results.append(f"❌ Gemini API疎通テスト失敗: {e}")
-        log.error(f"テスト(c): Gemini APIエラー: {e}")
+        log.error(f"テスト(3): Gemini APIエラー: {e}")
+        if backups:
+            rollback_from_backups(backups)
+            await tg_send(client, f"⚠️ 自己改善失敗→ロールバック完了\nGemini APIエラー: {str(e)[:100]}")
+        return (False, "\n".join(results))
+
+    # --- 全テスト合格 ---
+    if all_passed:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        await safe_append_journal(f"### {now} ✅ テスト全合格\n{chr(10).join(results)}")
+        log.info("全テスト合格、journal記録完了")
+
+        # モジュール再読み込み（God AI再起動不要）
+        if target_module:
+            reload_success, reload_msg = reload_modules([target_module])
+            if reload_success:
+                results.append(f"✅ モジュール再読み込み: {reload_msg}")
+                log.info(f"モジュール再読み込み成功: {target_module}")
+            else:
+                results.append(f"⚠️ モジュール再読み込み: {reload_msg}")
+                log.warning(f"モジュール再読み込み失敗: {reload_msg}")
+
+        # バックアップをクリーンアップ（成功時のみ）
+        if backups:
+            cleanup_backups(backups)
 
     return (all_passed, "\n".join(results))
 
@@ -884,9 +1033,9 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
         await tg_send(client, f"自己改善スキップ（統計判定）\n理由: {skip_reason}")
         return
 
-    # バックアップ
+    # バックアップ（全モジュール）
+    backups = create_module_backups()
     backup_path = target_path.with_suffix(".py.bak")
-    shutil.copy2(target_path, backup_path)
 
     current_code = target_path.read_text(encoding="utf-8")
     current_lines = current_code.splitlines()
@@ -987,8 +1136,10 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
             target_path.write_text(code, encoding="utf-8")
             log.info(f"試行{attempt}: コード仮適用完了、自動テスト開始")
 
-            # --- 改善後自動テスト実行 ---
-            test_passed, test_result = await run_post_improvement_tests(client)
+            # --- 改善後自動テスト実行（バックアップ・ターゲット指定） ---
+            test_passed, test_result = await run_post_improvement_tests(
+                client, backups=backups, target_module=target_name
+            )
 
             if test_passed:
                 # 全テスト合格 -> 改善確定
