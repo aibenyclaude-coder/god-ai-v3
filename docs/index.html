@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>God AI v3.0</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            text-align: center;
+        }
+        h1 {
+            font-size: 3.5rem;
+            margin-bottom: 1rem;
+            background: linear-gradient(90deg, #00d4ff, #7b2cbf, #e94560);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .version {
+            font-size: 1.2rem;
+            color: #7b2cbf;
+            margin-bottom: 2rem;
+        }
+        .description {
+            font-size: 1.3rem;
+            line-height: 1.8;
+            margin-bottom: 2rem;
+            color: #e0e0e0;
+        }
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+        .feature {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 1.5rem;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .feature:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 212, 255, 0.2);
+        }
+        .feature h3 {
+            color: #00d4ff;
+            margin-bottom: 0.5rem;
+        }
+        .feature p {
+            color: #b0b0b0;
+            font-size: 0.95rem;
+        }
+        .links {
+            margin-top: 2rem;
+        }
+        .links a {
+            display: inline-block;
+            margin: 0.5rem;
+            padding: 0.8rem 1.5rem;
+            background: linear-gradient(90deg, #7b2cbf, #e94560);
+            color: #fff;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: bold;
+            transition: opacity 0.3s;
+        }
+        .links a:hover {
+            opacity: 0.85;
+        }
+        footer {
+            margin-top: 3rem;
+            color: #666;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>God AI</h1>
+        <p class="version">Version 3.0</p>
+        <p class="description">
+            自律的に思考し、学習し、進化する次世代AIシステム。<br>
+            継続的な自己改善と記憶の永続化を実現。
+        </p>
+
+        <div class="features">
+            <div class="feature">
+                <h3>自律思考</h3>
+                <p>外部入力なしで独立した思考プロセスを実行</p>
+            </div>
+            <div class="feature">
+                <h3>永続記憶</h3>
+                <p>会話と学習内容を長期的に保持・活用</p>
+            </div>
+            <div class="feature">
+                <h3>自己進化</h3>
+                <p>経験から学び、継続的に能力を向上</p>
+            </div>
+            <div class="feature">
+                <h3>日誌システム</h3>
+                <p>思考と成長の記録を自動的に保存</p>
+            </div>
+        </div>
+
+        <div class="links">
+            <a href="https://github.com/aibenyclaude-coder/god-ai-v3">GitHub Repository</a>
+        </div>
+
+        <footer>
+            <p>God AI v3.0 - Built with autonomy in mind</p>
+        </footer>
+    </div>
+</body>
+</html>
