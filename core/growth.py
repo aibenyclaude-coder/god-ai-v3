@@ -6,13 +6,16 @@ import ast
 import asyncio
 import difflib
 import json
+import re
 import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
 from config import (
-    GOD_PY_PATH, JOURNAL_PATH, REFLECTION_INTERVAL, SELF_GROWTH_INTERVAL, log
+    GOD_PY_PATH, JOURNAL_PATH, REFLECTION_INTERVAL, SELF_GROWTH_INTERVAL, log,
+    BASE_DIR, CORE_DIR, STATE_PATH, IDENTITY_PATH
 )
 from memory import (
     load_state, save_state, read_file, append_journal,
@@ -21,11 +24,202 @@ from memory import (
 from brain import think_gemini, think_claude_heavy
 from jobqueue import Priority, create_job
 
+# --- CLAUDE.md パス ---
+CLAUDE_MD_PATH = BASE_DIR / "CLAUDE.md"
+
+# --- モジュールパス定義 ---
+MODULE_PATHS = {
+    "god": CORE_DIR / "god.py",
+    "growth": CORE_DIR / "growth.py",
+    "brain": CORE_DIR / "brain.py",
+    "memory": CORE_DIR / "memory.py",
+    "config": CORE_DIR / "config.py",
+    "jobqueue": CORE_DIR / "jobqueue.py",
+    "handoff": CORE_DIR / "handoff.py",
+    "gdrive": CORE_DIR / "gdrive.py",
+}
+
 # --- 振り返り排他制御 ---
 _reflecting = False
 
 def is_reflecting() -> bool:
     return _reflecting
+
+
+# --- CLAUDE.md 読み込み ---
+def load_claude_md() -> str:
+    """CLAUDE.mdの内容を読み込む"""
+    if CLAUDE_MD_PATH.exists():
+        try:
+            return CLAUDE_MD_PATH.read_text(encoding="utf-8")
+        except Exception as e:
+            log.warning(f"CLAUDE.md読み込み失敗: {e}")
+    return ""
+
+
+# --- CLAUDE.md 自動更新 ---
+def update_claude_md():
+    """振り返り完了時にCLAUDE.mdを自動更新"""
+    log.info("CLAUDE.md自動更新開始")
+    try:
+        state = load_state()
+        identity_text = ""
+        if IDENTITY_PATH.exists():
+            identity_text = IDENTITY_PATH.read_text(encoding="utf-8")
+        journal_text = read_file(JOURNAL_PATH, tail=100)
+        recent_events = _extract_recent_events(journal_text, max_events=10)
+        known_issues = _extract_known_issues(journal_text)
+        module_list = _generate_module_list()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        content = _generate_claude_md_content(
+            now, identity_text, state, module_list, recent_events, known_issues
+        )
+        CLAUDE_MD_PATH.write_text(content, encoding="utf-8")
+        log.info(f"CLAUDE.md更新完了: {CLAUDE_MD_PATH}")
+    except Exception as e:
+        log.error(f"CLAUDE.md更新失敗: {e}", exc_info=True)
+
+
+def _extract_recent_events(journal_text: str, max_events: int = 10) -> list[str]:
+    """journalから直近の重要イベントを抽出"""
+    events = []
+    for line in journal_text.splitlines():
+        if line.startswith("###"):
+            important_keywords = ["成功", "失敗", "エラー", "改善", "誕生", "完了", "開始"]
+            if any(kw in line for kw in important_keywords):
+                event = line.replace("###", "").strip()
+                if event and event not in events:
+                    events.append(event)
+    return events[-max_events:] if len(events) > max_events else events
+
+
+def _extract_known_issues(journal_text: str) -> list[str]:
+    """journalから既知の問題を抽出"""
+    issues = []
+    for line in journal_text.splitlines():
+        line_lower = line.lower()
+        if any(kw in line_lower for kw in ["問題", "エラー", "失敗", "バグ"]):
+            issue = line.strip()
+            if 10 < len(issue) < 200 and issue not in issues:
+                issues.append(issue)
+    return issues[-5:] if len(issues) > 5 else issues
+
+
+def _generate_module_list() -> str:
+    """core/内のモジュール一覧と説明を生成"""
+    descriptions = {
+        "god.py": "メインエントリ・Telegramボット",
+        "config.py": "設定・定数・環境変数",
+        "memory.py": "ファイルI/O・状態管理",
+        "brain.py": "AI思考（Gemini/Claude CLI）",
+        "growth.py": "振り返り・自己改善",
+        "jobqueue.py": "優先度付きジョブキュー",
+        "handoff.py": "HANDOFF.md自動生成",
+        "gdrive.py": "Google Driveバックアップ",
+    }
+    lines = []
+    for name, desc in descriptions.items():
+        if (CORE_DIR / name).exists():
+            lines.append(f"| `{name}` | {desc} |")
+    return "\n".join(lines)
+
+
+def _generate_claude_md_content(
+    now: str, identity_text: str, state: dict,
+    module_list: str, recent_events: list[str], known_issues: list[str]
+) -> str:
+    """CLAUDE.mdの内容を生成"""
+    identity_summary = "\n".join(identity_text.splitlines()[:40]) if identity_text else ""
+    events_text = "\n".join([f"{i+1}. **{e}**" for i, e in enumerate(recent_events)])
+    issues_text = "\n".join([f"{i+1}. {iss}" for i, iss in enumerate(known_issues)]) if known_issues else "(現在認識している問題なし)"
+    return f"""# God AI v3.0 - Claude Memory File
+
+**最終更新**: {now}
+
+---
+
+## 1. 目的・設計思想
+
+{identity_summary}
+
+---
+
+## 2. コード構成
+
+### 各モジュールの責務
+
+| モジュール | 責務 |
+|-----------|------|
+{module_list}
+
+---
+
+## 3. 現在の状態
+
+```json
+{json.dumps(state, ensure_ascii=False, indent=2)}
+```
+
+---
+
+## 4. 直近の成長履歴（重要イベント）
+
+{events_text if events_text else "(イベントなし)"}
+
+---
+
+## 5. 既知の問題
+
+{issues_text}
+
+---
+
+## 6. 自己改善時の注意事項
+
+### 必須チェック
+1. **構文チェック必須**: `python3 -m py_compile <file>` で検証
+2. **差分記録**: 変更前後の差分をjournalに記録
+3. **重複チェック**: 同じ改善提案を繰り返さない
+4. **バックアップ**: 改善前に `.py.bak` を作成
+5. **ロールバック**: 3回失敗したら自動ロールバック
+
+### コード生成ルール
+- マークダウンのバッククォートで囲まない
+- 先頭は `#!/usr/bin/env python3` から
+- 変更箇所以外は絶対にそのまま維持
+- 文字列リテラルのクォート対応に注意
+
+### 禁止事項
+- `except:pass` - 全エラーをログに残す
+- Benyの個人情報の外部送信
+
+---
+
+*このファイルは振り返り完了時に自動更新される*
+"""
+
+
+# --- 改善対象モジュールの自動選択 ---
+def select_target_module(improvement_text: str) -> tuple[Path, str]:
+    """改善内容から対象モジュールを自動選択。戻り値: (モジュールパス, モジュール名)"""
+    improvement_lower = improvement_text.lower()
+    if any(kw in improvement_lower for kw in ["振り返り", "reflection", "自己改善", "growth", "improve"]):
+        return (MODULE_PATHS["growth"], "growth")
+    elif any(kw in improvement_lower for kw in ["gemini", "claude", "think", "脳", "brain", "ai"]):
+        return (MODULE_PATHS["brain"], "brain")
+    elif any(kw in improvement_lower for kw in ["memory", "state", "journal", "保存", "読み込み"]):
+        return (MODULE_PATHS["memory"], "memory")
+    elif any(kw in improvement_lower for kw in ["queue", "job", "キュー", "priority"]):
+        return (MODULE_PATHS["jobqueue"], "jobqueue")
+    elif any(kw in improvement_lower for kw in ["config", "設定", "定数", "env"]):
+        return (MODULE_PATHS["config"], "config")
+    elif any(kw in improvement_lower for kw in ["handoff", "引き継ぎ"]):
+        return (MODULE_PATHS["handoff"], "handoff")
+    elif any(kw in improvement_lower for kw in ["drive", "google", "upload", "backup"]):
+        return (MODULE_PATHS["gdrive"], "gdrive")
+    else:
+        return (MODULE_PATHS["god"], "god")
+
 
 # --- コード構文検証関数 ---
 def validate_code_syntax(code: str) -> tuple[bool, str]:
@@ -95,20 +289,21 @@ async def _drive_backup_silent():
         log.debug(f"Drive自動バックアップスキップ: {e}")
 
 # --- 振り返りサイクル ---
-async def reflection_cycle(client: httpx.AsyncClient) -> bool:
-    """振り返り実行。戻り値: 実行したかどうか"""
+async def reflection_cycle(client: httpx.AsyncClient) -> tuple[bool, str]:
+    """振り返り実行。戻り値: (実行したかどうか, 振り返り結果の要約)"""
     global _reflecting
     if _reflecting:
         log.warning("振り返り中のため新しい振り返り要求を無視")
-        return False
+        return (False, "")
     _reflecting = True
     try:
-        await _reflection_cycle_inner(client)
-        return True
+        result = await _reflection_cycle_inner(client)
+        return (True, result)
     finally:
         _reflecting = False
 
-async def _reflection_cycle_inner(client: httpx.AsyncClient):
+async def _reflection_cycle_inner(client: httpx.AsyncClient) -> str:
+    """振り返り実行の内部処理。戻り値: 振り返り結果のテキスト"""
     from god import tg_send
     log.info("振り返りサイクル開始")
     state = load_state()
@@ -137,7 +332,7 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient):
     except Exception as e:
         log.error(f"Reflection failed: {e}")
         append_journal(f"### {datetime.now().strftime('%H:%M')} 振り返り失敗\n{e}")
-        return
+        return ""
 
     # journalに追記
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -170,21 +365,18 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient):
             else:
                 await self_improve(client, reflection)
 
+    # CLAUDE.md自動更新
+    update_claude_md()
+
     log.info("振り返りサイクル完了")
+    return reflection
 
 # --- 自己改善 ---
 async def self_improve(client: httpx.AsyncClient, reflection: str):
-    """コード自己改善（構文チェック強化、最大3回リトライ）"""
+    """コード自己改善（構文チェック強化、最大3回リトライ、モジュール選択）"""
     from god import tg_send
 
     log.info("自己改善プロセス開始")
-
-    # バックアップ
-    backup_path = GOD_PY_PATH.with_suffix(".py.bak")
-    shutil.copy2(GOD_PY_PATH, backup_path)
-
-    current_code = GOD_PY_PATH.read_text(encoding="utf-8")
-    current_lines = current_code.splitlines()
 
     # 改善行を抽出
     improvements = []
@@ -196,16 +388,34 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
         return
 
     improvement_text = "\n".join(improvements)
+
+    # 改善対象モジュールを自動選択
+    target_path, target_name = select_target_module(improvement_text)
+    log.info(f"改善対象モジュール: {target_name} ({target_path})")
+
+    # バックアップ
+    backup_path = target_path.with_suffix(".py.bak")
+    shutil.copy2(target_path, backup_path)
+
+    current_code = target_path.read_text(encoding="utf-8")
+    current_lines = current_code.splitlines()
+
+    # CLAUDE.mdの内容を読み込み（コンテキスト用）
+    claude_md_content = load_claude_md()
+    claude_md_summary = claude_md_content[:2000] if claude_md_content else "(CLAUDE.mdなし)"
+
     MAX_RETRY = 3
     last_error = None
 
     for attempt in range(1, MAX_RETRY + 1):
-        log.info(f"自己改善 試行 {attempt}/{MAX_RETRY}")
+        log.info(f"自己改善 試行 {attempt}/{MAX_RETRY} (対象: {target_name})")
 
         if attempt == 1:
             prompt = (
                 "あなたはPythonコードの修正を行うアシスタントです。\n"
                 "以下の【改善内容】を【現在のコード】に適用してください。\n\n"
+                "【プロジェクト情報（CLAUDE.md要約）】\n"
+                f"{claude_md_summary}\n\n"
                 "【重要なルール】\n"
                 "- 修正後のPythonコード全文をそのまま出力してください\n"
                 "- 説明文は一切不要です。Pythonコードのみを出力してください\n"
@@ -214,6 +424,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 "- 変更箇所以外は絶対にそのまま維持してください\n"
                 "- 文字列リテラルのクォートの対応に注意してください\n"
                 f"【改善内容】\n{improvement_text}\n\n"
+                f"【対象モジュール】{target_name}.py\n\n"
                 f"【現在のコード】\n{current_code}"
             )
         else:
@@ -227,6 +438,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 "- コードの先頭は #!/usr/bin/env python3 から始めてください\n"
                 "- 変更箇所以外は絶対にそのまま維持してください\n"
                 f"【改善内容】\n{improvement_text}\n\n"
+                f"【対象モジュール】{target_name}.py\n\n"
                 f"【現在のコード（オリジナル）】\n{current_code}"
             )
 
@@ -281,8 +493,8 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
             diff_for_journal = "\n".join(diff[:50]) if diff else "(差分なし)"
 
             # 書き込み
-            GOD_PY_PATH.write_text(code, encoding="utf-8")
-            success_msg = f"自己改善成功（試行{attempt}/{MAX_RETRY}）\n改善内容: {improvement_text}"
+            target_path.write_text(code, encoding="utf-8")
+            success_msg = f"自己改善成功（試行{attempt}/{MAX_RETRY}）\n対象: {target_name}.py\n改善内容: {improvement_text}"
             append_journal(
                 f"### {datetime.now().strftime('%H:%M')} {success_msg}\n"
                 f"コード長: {len(current_code)} -> {len(code)}文字\n"
@@ -313,9 +525,10 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
             break
 
     # 全試行失敗 -> ロールバック
-    shutil.copy2(backup_path, GOD_PY_PATH)
+    shutil.copy2(backup_path, target_path)
     fail_msg = (
         f"自己改善 {MAX_RETRY}回試行して失敗。ロールバックしました。\n"
+        f"対象: {target_name}.py\n"
         f"最終エラー: {last_error}\n"
         f"改善内容: {improvement_text}"
     )
@@ -342,9 +555,10 @@ async def reflection_scheduler(client: httpx.AsyncClient):
                 log.warning("定期振り返り: 手動振り返り中のためスキップ")
                 continue
             await tg_send(client, f"定期振り返り開始... (次回: {REFLECTION_INTERVAL}秒後)")
-            executed = await reflection_cycle(client)
+            executed, result = await reflection_cycle(client)
             if executed:
-                await tg_send(client, "定期振り返り完了。journalを更新しました。")
+                summary = result[:200] + "..." if len(result) > 200 else result
+                await tg_send(client, f"定期振り返り完了。\n\n{summary}")
                 log.info("定期振り返り: 完了")
             else:
                 log.warning("定期振り返り: 他の振り返りと競合のためスキップ")
