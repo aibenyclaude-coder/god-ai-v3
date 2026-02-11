@@ -6,16 +6,21 @@ import ast
 import asyncio
 import difflib
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
+import time as time_module
+
 from config import (
     GOD_PY_PATH, JOURNAL_PATH, REFLECTION_INTERVAL, SELF_GROWTH_INTERVAL, log,
-    BASE_DIR, CORE_DIR, STATE_PATH, IDENTITY_PATH
+    BASE_DIR, CORE_DIR, STATE_PATH, IDENTITY_PATH, MEMORY_DIR
 )
 from memory import (
     load_state, save_state, read_file, append_journal,
@@ -219,6 +224,122 @@ def select_target_module(improvement_text: str) -> tuple[Path, str]:
         return (MODULE_PATHS["gdrive"], "gdrive")
     else:
         return (MODULE_PATHS["god"], "god")
+
+
+# --- 改善後自動テスト ---
+async def run_post_improvement_tests(client: httpx.AsyncClient) -> tuple[bool, str]:
+    """
+    改善後テスト実行。戻り値: (全合格か, 結果メッセージ)
+
+    テスト項目:
+    a. 全モジュール構文チェック: python3 -m py_compile で各.pyファイルをチェック
+    b. God AI起動テスト: 起動→5秒待ち→/statusが応答するか→停止
+    c. Gemini API疎通テスト: 簡単なprompt送信→応答あるか
+    """
+    results = []
+    all_passed = True
+
+    # --- a. 全モジュール構文チェック ---
+    log.info("テスト(a): 全モジュール構文チェック開始")
+    syntax_errors = []
+    for module_name, module_path in MODULE_PATHS.items():
+        if module_path.exists():
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "py_compile", str(module_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                if proc.returncode != 0:
+                    syntax_errors.append(f"{module_name}: {proc.stderr.strip()}")
+                    log.error(f"構文エラー in {module_name}: {proc.stderr.strip()}")
+            except subprocess.TimeoutExpired:
+                syntax_errors.append(f"{module_name}: タイムアウト")
+                log.error(f"構文チェックタイムアウト: {module_name}")
+            except Exception as e:
+                syntax_errors.append(f"{module_name}: {e}")
+                log.error(f"構文チェックエラー in {module_name}: {e}")
+
+    if syntax_errors:
+        all_passed = False
+        results.append(f"❌ 構文チェック失敗: {'; '.join(syntax_errors)}")
+    else:
+        results.append("✅ 構文チェック全合格")
+        log.info("テスト(a): 全モジュール構文チェック合格")
+
+    # 構文エラーがある場合は以降のテストをスキップ
+    if not all_passed:
+        return (False, "\n".join(results))
+
+    # --- b. God AI起動テスト ---
+    log.info("テスト(b): God AI起動テスト開始")
+    god_test_passed = False
+    god_process = None
+    try:
+        # 現在のプロセスとは別にGod AIを起動
+        env = os.environ.copy()
+        god_process = subprocess.Popen(
+            [sys.executable, str(CORE_DIR / "god.py")],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=str(CORE_DIR)
+        )
+
+        # 5秒待つ
+        await asyncio.sleep(5)
+
+        # プロセスが生きているか確認
+        if god_process.poll() is None:
+            # /statusが応答するかテスト（Telegram APIを直接呼ぶのは難しいので、プロセスが生きていることを確認）
+            god_test_passed = True
+            results.append("✅ God AI起動テスト合格（5秒後も稼働中）")
+            log.info("テスト(b): God AI起動テスト合格")
+        else:
+            returncode = god_process.returncode
+            stderr = god_process.stderr.read().decode() if god_process.stderr else ""
+            all_passed = False
+            results.append(f"❌ God AI起動テスト失敗: 5秒以内にクラッシュ(returncode={returncode}, stderr={stderr[:200]})")
+            log.error(f"テスト(b): God AIが5秒以内にクラッシュ: {stderr[:200]}")
+    except Exception as e:
+        all_passed = False
+        results.append(f"❌ God AI起動テスト失敗: {e}")
+        log.error(f"テスト(b): God AI起動テストエラー: {e}")
+    finally:
+        # テスト用プロセスを停止
+        if god_process and god_process.poll() is None:
+            try:
+                god_process.terminate()
+                await asyncio.sleep(1)
+                if god_process.poll() is None:
+                    god_process.kill()
+                log.info("テスト(b): テスト用God AIプロセスを停止")
+            except Exception as e:
+                log.warning(f"テスト用プロセス停止エラー: {e}")
+
+    # 起動テスト失敗の場合は以降のテストをスキップ
+    if not god_test_passed:
+        return (False, "\n".join(results))
+
+    # --- c. Gemini API疎通テスト ---
+    log.info("テスト(c): Gemini API疎通テスト開始")
+    try:
+        from brain import think_gemini
+        response, brain_name = await think_gemini("Hello, respond with 'OK' if you can read this.")
+        if response and len(response) > 0:
+            results.append(f"✅ Gemini API疎通テスト合格（応答あり: {brain_name}）")
+            log.info(f"テスト(c): Gemini API疎通テスト合格: {response[:50]}")
+        else:
+            all_passed = False
+            results.append("❌ Gemini API疎通テスト失敗: 応答が空")
+            log.error("テスト(c): Gemini API応答が空")
+    except Exception as e:
+        all_passed = False
+        results.append(f"❌ Gemini API疎通テスト失敗: {e}")
+        log.error(f"テスト(c): Gemini APIエラー: {e}")
+
+    return (all_passed, "\n".join(results))
 
 
 # --- コード構文検証関数 ---
@@ -492,17 +613,40 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
 
             diff_for_journal = "\n".join(diff[:50]) if diff else "(差分なし)"
 
-            # 書き込み
+            # 書き込み（仮適用）
             target_path.write_text(code, encoding="utf-8")
-            success_msg = f"自己改善成功（試行{attempt}/{MAX_RETRY}）\n対象: {target_name}.py\n改善内容: {improvement_text}"
-            append_journal(
-                f"### {datetime.now().strftime('%H:%M')} {success_msg}\n"
-                f"コード長: {len(current_code)} -> {len(code)}文字\n"
-                f"```diff\n{diff_for_journal}\n```"
-            )
-            await tg_send(client, f"[自己改善] {success_msg}\nコード長: {len(current_code)} -> {len(code)}文字")
-            log.info(f"自己改善成功（試行{attempt}）: {len(current_code)} -> {len(code)}文字")
-            return
+            log.info(f"試行{attempt}: コード仮適用完了、自動テスト開始")
+
+            # --- 改善後自動テスト実行 ---
+            test_passed, test_result = await run_post_improvement_tests(client)
+
+            if test_passed:
+                # 全テスト合格 -> 改善確定
+                success_msg = f"自己改善成功（試行{attempt}/{MAX_RETRY}）\n対象: {target_name}.py\n改善内容: {improvement_text}"
+                append_journal(
+                    f"### {datetime.now().strftime('%H:%M')} {success_msg}\n"
+                    f"コード長: {len(current_code)} -> {len(code)}文字\n"
+                    f"```diff\n{diff_for_journal}\n```\n"
+                    f"✅ テスト全合格\n{test_result}"
+                )
+                await tg_send(client, f"[自己改善] {success_msg}\nコード長: {len(current_code)} -> {len(code)}文字\n✅ テスト全合格")
+                log.info(f"自己改善成功（試行{attempt}）: {len(current_code)} -> {len(code)}文字、テスト全合格")
+                return
+            else:
+                # テスト失敗 -> 即ロールバック
+                shutil.copy2(backup_path, target_path)
+                # 失敗したテスト名を抽出
+                failed_tests = [line for line in test_result.splitlines() if line.startswith("❌")]
+                failed_test_name = failed_tests[0] if failed_tests else "不明なテスト"
+                log.error(f"試行{attempt}: 自動テスト失敗、ロールバック実行: {failed_test_name}")
+                append_journal(
+                    f"### {datetime.now().strftime('%H:%M')} 自己改善 試行{attempt}/{MAX_RETRY} テスト失敗でロールバック\n"
+                    f"❌ {failed_test_name}\n{test_result}\n改善内容: {improvement_text}"
+                )
+                await tg_send(client, f"⚠️ 自己改善失敗: {failed_test_name}\nロールバック済み\n改善内容: {improvement_text[:100]}")
+                last_error = f"自動テスト失敗: {failed_test_name}"
+                if attempt < MAX_RETRY:
+                    await asyncio.sleep(3)
 
         except (SyntaxError, ValueError) as e:
             last_error = str(e)
