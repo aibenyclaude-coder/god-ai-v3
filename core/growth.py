@@ -23,7 +23,7 @@ import time as time_module
 import hashlib
 
 from config import (
-    GOD_PY_PATH, JOURNAL_PATH, REFLECTION_INTERVAL, SELF_GROWTH_INTERVAL, log,
+    GOD_PY_PATH, JOURNAL_PATH, REFLECTION_INTERVAL, GROWTH_CYCLE_SLEEP, log,
     BASE_DIR, CORE_DIR, STATE_PATH, IDENTITY_PATH, MEMORY_DIR
 )
 
@@ -34,7 +34,7 @@ from memory import (
     safe_save_state, safe_append_journal
 )
 from brain import think_gemini, think_claude
-from jobqueue import Priority, create_job
+from jobqueue import Priority, create_job, is_p1_interrupted, clear_p1_interrupt
 
 # --- CLAUDE.md パス ---
 CLAUDE_MD_PATH = BASE_DIR / "CLAUDE.md"
@@ -1269,7 +1269,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 f"{claude_md_summary}\n\n"
                 "【重要なルール】\n"
                 "- 全コードを出力するな。変更箇所のみ以下の形式で出力しろ：\n"
-                "<<<BEFORE>>>\n変更前のコード（前後3行含む）\n<<<AFTER>>>\n変更後のコード\n<<<END>>>\n"
+                "<<<BEFORE>>>\n変更後のコード\n<<<AFTER>>>\n変更後のコード\n<<<END>>>\n"
                 "- 複数箇所ある場合は<<<BEFORE>>><<<AFTER>>><<<END>>>を繰り返す\n"
                 "- 説明文は一切不要。パッチのみを出力\n"
                 "- インデントや空白を正確に維持すること\n"
@@ -1284,7 +1284,7 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
                 f"前回の修正でエラーが発生しました: {last_error}\n\n"
                 "【重要なルール】\n"
                 "- 全コードを出力するな。変更箇所のみ以下の形式で出力しろ：\n"
-                "<<<BEFORE>>>\n変更前のコード（前後3行含む）\n<<<AFTER>>>\n変更後のコード\n<<<END>>>\n"
+                "<<<BEFORE>>>\n変更後のコード\n<<<AFTER>>>\n変更後のコード\n<<<END>>>\n"
                 "- 複数箇所ある場合は<<<BEFORE>>><<<AFTER>>><<<END>>>を繰り返す\n"
                 "- 説明文は一切不要。パッチのみを出力\n"
                 "- インデントや空白を正確に維持すること\n"
@@ -1442,6 +1442,9 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
     # 失敗をステータスに記録（3回失敗するとskippedに自動変更される）
     record_improvement(improvement_text, "failed")
 
+    # エラー根本分析を実行
+    analysis = await _analyze_error_root_cause(last_error, improvement_text, target_name)
+
     fail_msg = (
         f"自己改善 {MAX_RETRY}回試行して失敗。ロールバックしました。\n"
         f"対象: {target_name}.py\n"
@@ -1449,14 +1452,64 @@ async def self_improve(client: httpx.AsyncClient, reflection: str):
         f"改善内容: {improvement_text}"
     )
     log.error(fail_msg)
-    await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} {fail_msg}")
-    await tg_send(
-        client,
-        f"自己改善 {MAX_RETRY}回失敗。ロールバックしました。\n"
-        f"最終エラー: {last_error}\n"
-        f"改善内容: {improvement_text}\n"
-        f"Benyの判断を仰ぎます。"
-    )
+    await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} {fail_msg}\n根本分析: {analysis}")
+
+    # 同じエラーが3回続いたかチェック
+    error_count = _count_consecutive_errors(target_name)
+    if error_count >= 3:
+        await tg_send(
+            client,
+            f"同じモジュール({target_name})で{error_count}回連続失敗。別の改善に移ります。\n"
+            f"最終エラー: {last_error}\n"
+            f"根本分析: {analysis[:200]}"
+        )
+        log.warning(f"{target_name}で{error_count}回連続失敗、Benyに通知済み")
+    else:
+        await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} エラー分析結果\n{analysis}")
+        log.info(f"エラー分析完了、次のサイクルで修正を試みる: {analysis[:100]}")
+
+# --- エラー根本分析 ---
+async def _analyze_error_root_cause(error: str, improvement_text: str, module: str) -> str:
+    """Geminiにエラーの原因と解決策を聞く"""
+    prompt = f"""あなたはコードデバッグの専門家。以下のエラーの原因と解決策を分析せよ。
+
+【エラー内容】
+{error}
+
+【試みた改善内容】
+{improvement_text}
+
+【対象モジュール】
+{module}.py
+
+【タスク】
+1. このエラーの根本原因は何か？
+2. 同じ失敗を繰り返さないためにどうすべきか？
+3. 代替アプローチはあるか？
+
+簡潔に日本語で答えろ。各項目を1-2文で。"""
+
+    try:
+        analysis, brain_name = await think_gemini(prompt)
+        log.info(f"エラー根本分析完了 (brain: {brain_name})")
+        return analysis
+    except Exception as e:
+        log.error(f"エラー根本分析失敗: {e}")
+        return f"分析失敗: {e}"
+
+
+def _count_consecutive_errors(module: str) -> int:
+    """同じモジュールの連続エラー回数をカウント"""
+    stats = load_growth_stats()
+    recent = stats.get("last_10_results", [])
+    count = 0
+    for result in reversed(recent):
+        if not result.get("success") and result.get("module") == module:
+            count += 1
+        else:
+            break
+    return count
+
 
 # --- 定期振り返りスケジューラ ---
 async def reflection_scheduler(client: httpx.AsyncClient):
@@ -1486,110 +1539,54 @@ async def reflection_scheduler(client: httpx.AsyncClient):
             await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} 定期振り返りエラー\n{e}")
             await asyncio.sleep(10)
 
-# --- 自己成長提案ジョブ ---
-async def _self_growth_job(client: httpx.AsyncClient):
-    """自己成長提案ジョブの実行（統計活用版）"""
-    log.info("自己成長提案ジョブ開始")
-    state = load_state()
-    journal_tail = read_file(JOURNAL_PATH, tail=30)
+# --- 連続自己成長サイクル（振り返り→自己改善→即次サイクル） ---
+async def _continuous_growth_cycle(client: httpx.AsyncClient):
+    """1サイクル: 振り返り→自己改善→完了"""
+    log.info("連続成長サイクル: 開始")
 
-    # 成長統計を取得してプロンプトに活用
-    stats = load_growth_stats()
-    stats_summary = get_stats_summary()
+    # P1割り込みチェック（Benyのメッセージ優先）
+    if is_p1_interrupted():
+        log.info("連続成長サイクル: P1割り込みにより中断")
+        clear_p1_interrupt()
+        return
 
-    # 統計に基づく追加ガイダンスを生成
-    guidance_lines = []
+    # 振り返り実行
+    executed, result = await reflection_cycle(client)
+    if not executed:
+        log.info("連続成長サイクル: 振り返りスキップ（他の振り返りと競合）")
+        return
 
-    # 失敗理由の分析
-    failure_reasons = stats["failure_reasons"]
-    for reason, count in failure_reasons.items():
-        if count >= 3:
-            if reason == "timeout":
-                guidance_lines.append(f"- タイムアウトが{count}回発生。処理の軽量化やモジュール分割を検討")
-            elif reason == "syntax_error":
-                guidance_lines.append(f"- 構文エラーが{count}回発生。より慎重なコード生成が必要")
-            elif reason == "test_fail":
-                guidance_lines.append(f"- テスト失敗が{count}回発生。テストカバレッジの改善を検討")
-            elif reason == "duplicate":
-                guidance_lines.append(f"- 重複提案が{count}回発生。より新しい観点での提案が必要")
+    log.info("連続成長サイクル: 振り返り完了、自己改善はreflection_cycle内で実行済み")
 
-    # 成功率が低いモジュールの回避、高いモジュールの優先
-    modules = stats["modules_improved"]
-    if any(v > 0 for v in modules.values()):
-        sorted_modules = sorted(modules.items(), key=lambda x: x[1], reverse=True)
-        top_module = sorted_modules[0]
-        if top_module[1] > 0:
-            guidance_lines.append(f"- 推奨モジュール: {top_module[0]}（過去{top_module[1]}回成功）")
 
-    guidance_text = "\n".join(guidance_lines) if guidance_lines else "(特になし)"
-
-    prompt = f"""あなたはGod AI。自律型AIとして自己成長を提案せよ。
-
-【現在の状態】
-{json.dumps(state, ensure_ascii=False)}
-
-【成長統計】
-{stats_summary}
-
-【統計に基づく改善ガイダンス】
-{guidance_text}
-
-【最近のjournal】
-{journal_tail}
-
-【タスク】
-以下の観点で自己成長提案を1つだけ挙げよ：
-1. 新しい機能追加の提案
-2. パフォーマンス改善の提案
-3. コード品質向上の提案
-4. ユーザー体験改善の提案
-
-【重要な制約】
-- 統計に基づくガイダンスを考慮すること
-- 過去に何度も失敗している種類の改善は避けること
-- 成功率の高いモジュールを優先すること
-- タイムアウトが多い場合はモジュール分割を検討すること
-
-簡潔に日本語で提案せよ。
-実装可能な具体的提案を「GROWTH_PROPOSAL:」で始まる行に書け。"""
-
-    try:
-        proposal, brain_name = await think_gemini(prompt)
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        await safe_append_journal(f"### {now} 自己成長提案 (brain: {brain_name})\n{proposal}")
-
-        if "GROWTH_PROPOSAL:" in proposal:
-            for line in proposal.splitlines():
-                if line.strip().startswith("GROWTH_PROPOSAL:"):
-                    prop = line.strip().replace("GROWTH_PROPOSAL:", "").strip()
-                    log.info(f"自己成長提案: {prop}")
-
-        log.info("自己成長提案ジョブ完了")
-
-    except Exception as e:
-        log.error(f"自己成長提案失敗: {e}")
-
-# --- 自己成長スケジューラ ---
+# --- 自己成長スケジューラ（連続実行版） ---
 async def self_growth_scheduler(client: httpx.AsyncClient):
-    """10分ごとに自己成長提案をP3としてキューに登録"""
-    log.info(f"自己成長スケジューラ開始 (間隔: {SELF_GROWTH_INTERVAL}秒)")
-    await asyncio.sleep(60)  # 起動後60秒待ってから開始
+    """連続自己成長: 振り返り→自己改善→sleep(10)→次のサイクル
+
+    30分間隔を廃止。完了したら即座に次のサイクルに入る。
+    sleep(10)のみ挟んでAPI負荷を軽減。
+    自己改善タスクはジョブキューにP3として登録。
+    """
+    log.info(f"連続自己成長スケジューラ開始 (サイクル間隔: {GROWTH_CYCLE_SLEEP}秒)")
+    await asyncio.sleep(30)  # 起動後30秒待ってから開始
 
     while True:
         try:
+            # P3ジョブとしてキューに登録
             await create_job(
                 priority=Priority.P3_BACKGROUND,
-                job_type="self_growth",
-                handler=_self_growth_job,
+                job_type="continuous_growth",
+                handler=_continuous_growth_cycle,
                 args=(client,),
-                description="自己成長提案の生成",
+                description="連続成長サイクル（振り返り→自己改善）",
             )
-            log.info("自己成長ジョブをキューに追加")
-            await asyncio.sleep(SELF_GROWTH_INTERVAL)
+            log.info("連続成長ジョブをキューに追加")
+            # 完了後、短い待機のみ（API負荷軽減）
+            await asyncio.sleep(GROWTH_CYCLE_SLEEP)
         except asyncio.CancelledError:
-            log.info("自己成長スケジューラ: キャンセルされました")
+            log.info("連続自己成長スケジューラ: キャンセルされました")
             raise
         except Exception as e:
-            log.error(f"自己成長スケジューラエラー: {e}", exc_info=True)
-            await asyncio.sleep(60)
+            log.error(f"連続自己成長スケジューラエラー: {e}", exc_info=True)
+            await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} 連続成長エラー\n{e}")
+            await asyncio.sleep(GROWTH_CYCLE_SLEEP)
