@@ -4,11 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
+import shutil
 
 import httpx
 
 from config import GOOGLE_AI_KEY, STATE_PATH, log
+from memory import load_state, safe_save_state
+
+# Claude CLIのパス（nohup環境でもフルパスで呼べるように）
+CLAUDE_PATH = shutil.which("claude") or "/opt/homebrew/bin/claude"
+
+# nohup環境用のPATH設定（node, npmなどが見つかるように）
+def _get_cli_env() -> dict:
+    """Claude CLI実行用の環境変数を取得"""
+    env = os.environ.copy()
+    # Homebrew paths for macOS (Intel and Apple Silicon)
+    homebrew_paths = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/homebrew/sbin", "/usr/local/sbin"]
+    current_path = env.get("PATH", "")
+    for p in homebrew_paths:
+        if p not in current_path:
+            current_path = f"{p}:{current_path}"
+    env["PATH"] = current_path
+    return env
+
+CLI_ENV = _get_cli_env()
 
 # --- 脳の使い分けカウンタ（state.jsonに永続化） ---
 def _load_brain_counts() -> tuple[int, int]:
@@ -19,15 +40,12 @@ def _load_brain_counts() -> tuple[int, int]:
     except (json.JSONDecodeError, FileNotFoundError):
         return 0, 0
 
-def _save_brain_counts(gemini: int, claude: int):
-    """state.jsonにカウンターを保存"""
-    try:
-        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, FileNotFoundError):
-        state = {}
+async def _save_brain_counts(gemini: int, claude: int):
+    """state.jsonにカウンターを保存（排他制御あり）"""
+    state = load_state()
     state["gemini_count"] = gemini
     state["claude_count"] = claude
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    await safe_save_state(state)
 
 # メモリ上のカウンタ（起動時にstate.jsonから読み込み）
 _gemini_count, _claude_count = _load_brain_counts()
@@ -36,8 +54,13 @@ _gemini_count, _claude_count = _load_brain_counts()
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GOOGLE_AI_KEY}"
 
-async def think_gemini(prompt: str) -> tuple[str, str]:
-    """Geminiで思考（429リトライ付き）。戻り値: (テキスト, 脳の名前)"""
+async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
+    """Geminiで思考（429リトライ付き）。戻り値: (テキスト, 脳の名前)
+
+    Args:
+        prompt: プロンプト
+        max_tokens: 最大出力トークン数（デフォルト4096、コード生成時は8192推奨）
+    """
     global _gemini_count
     max_retries = 3
     retry_delay = 8
@@ -49,7 +72,7 @@ async def think_gemini(prompt: str) -> tuple[str, str]:
                     GEMINI_URL,
                     json={
                         "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"maxOutputTokens": 2048},
+                        "generationConfig": {"maxOutputTokens": max_tokens},
                     },
                     timeout=60,
                 )
@@ -69,7 +92,7 @@ async def think_gemini(prompt: str) -> tuple[str, str]:
 
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 _gemini_count += 1
-                _save_brain_counts(_gemini_count, _claude_count)
+                await _save_brain_counts(_gemini_count, _claude_count)
                 return (text, f"Gemini {GEMINI_MODEL}")
         except Exception as e:
             if attempt < max_retries - 1 and "429" in str(e):
@@ -81,8 +104,12 @@ async def think_gemini(prompt: str) -> tuple[str, str]:
             return (text, "Claude CLI (fallback)")
 
 # --- Claude CLI ---
-async def think_claude(prompt: str) -> tuple[str, str]:
+async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
     """Claude CLIで思考（会話用、段階的タイムアウト対応）。戻り値: (テキスト, 脳の名前)
+
+    Args:
+        prompt: プロンプト
+        timeout: タイムアウト秒数（デフォルト120秒、コード生成時は280秒推奨）
 
     段階的リトライ戦略:
     - 1回目: 同じプロンプトでリトライ
@@ -104,18 +131,28 @@ async def think_claude(prompt: str) -> tuple[str, str]:
         try:
             result = await loop.run_in_executor(
                 None,
-                lambda p=prompt: subprocess.run(
-                    ["claude", "--print", "-p", p],
-                    capture_output=True, text=True, timeout=280,
+                lambda p=prompt, t=timeout: subprocess.run(
+                    [CLAUDE_PATH, "--print", "-p", p],
+                    capture_output=True, text=True, timeout=t,
+                    env=CLI_ENV,
                 ),
             )
+            # stderrがあればログ記録（原因特定用）
+            if result.stderr and result.stderr.strip():
+                log.error(f"Claude CLI stderr: {result.stderr[:500]}")
+
             if result.returncode == 0 and result.stdout.strip():
                 _claude_count += 1
-                _save_brain_counts(_gemini_count, _claude_count)
+                await _save_brain_counts(_gemini_count, _claude_count)
                 return (result.stdout.strip(), "Claude CLI")
-            log.error(f"Claude CLI attempt {attempt+1}: returncode={result.returncode}, stderr={result.stderr[:200]}")
+            # 詳細なエラーログ（stdout/stderr両方、プロンプト長も）
+            stdout_full = result.stdout if result.stdout else "(empty)"
+            stderr_full = result.stderr if result.stderr else "(empty)"
+            log.error(f"Claude CLI attempt {attempt+1}: returncode={result.returncode}, prompt_len={len(prompt)}, timeout={timeout}s")
+            log.error(f"  stdout: {stdout_full[:500]}")
+            log.error(f"  stderr: {stderr_full[:500]}")
         except subprocess.TimeoutExpired:
-            log.error(f"Claude CLI attempt {attempt+1}: timeout (280s)")
+            log.error(f"Claude CLI attempt {attempt+1}: timeout ({timeout}s)")
             # 3回目のタイムアウトはGeminiにフォールバック
             if attempt == 2:
                 log.warning("Claude CLI 3回タイムアウト、Geminiにフォールバック")
@@ -129,33 +166,7 @@ async def think_claude(prompt: str) -> tuple[str, str]:
             log.error(f"Claude CLI attempt {attempt+1}: {e}")
         if attempt < 2:
             await asyncio.sleep(3)
-    raise RuntimeError("Claude CLI failed after 3 attempts (timeout=280s)")
-
-async def think_claude_heavy(prompt: str) -> tuple[str, str]:
-    """Claude CLIで重い処理（自己改善用、タイムアウト280秒、リトライ強化）。戻り値: (テキスト, 脳の名前)"""
-    global _claude_count
-    loop = asyncio.get_running_loop()
-    for attempt in range(3):
-        try:
-            result = await loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    ["claude", "--print", "-p", prompt],
-                    capture_output=True, text=True, timeout=280,
-                ),
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                _claude_count += 1
-                _save_brain_counts(_gemini_count, _claude_count)
-                return (result.stdout.strip(), "Claude CLI")
-            log.error(f"Claude CLI heavy attempt {attempt+1}: returncode={result.returncode}, stderr={result.stderr[:200]}")
-        except subprocess.TimeoutExpired:
-            log.error(f"Claude CLI heavy attempt {attempt+1}: timeout (280s)")
-        except Exception as e:
-            log.error(f"Claude CLI heavy attempt {attempt+1}: {e}")
-        if attempt < 2:
-            await asyncio.sleep(5)
-    raise RuntimeError("Claude CLI heavy failed after 3 attempts (timeout=280s)")
+    raise RuntimeError(f"Claude CLI failed after 3 attempts (timeout={timeout}s)")
 
 # --- 統合思考関数 ---
 async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
