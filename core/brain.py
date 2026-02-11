@@ -213,23 +213,25 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
     original_prompt = prompt
 
     # 段階的タイムアウト設定
+    # タイムアウト値を徐々に長くし、リトライ間隔も設定
     timeouts = [60, 90, 120]
     sleep_between_retries = 5
 
     for attempt in range(3):
         current_timeout = timeouts[attempt]
 
-        # 2回目以降はプロンプトを短縮
-        if attempt == 1:
+        # 2回目以降はプロンプトを短縮してリトライ
+        # プロンプトが長すぎるとタイムアウトしやすいため
+        current_prompt = original_prompt
+        if attempt >= 1 and len(original_prompt) > 1000:
             # プロンプトを最後の1000文字に短縮
-            if len(prompt) > 1000:
-                prompt = "...(省略)...\n" + original_prompt[-1000:]
-                log.warning(f"Claude CLI attempt {attempt+1}: プロンプトを短縮 ({len(original_prompt)} -> {len(prompt)}文字)")
+            current_prompt = "...(省略)...\n" + original_prompt[-1000:]
+            log.warning(f"Claude CLI attempt {attempt+1}: プロンプトを短縮 ({len(original_prompt)} -> {len(current_prompt)}文字)")
 
         try:
             result = await loop.run_in_executor(
                 None,
-                lambda p=prompt, t=current_timeout: subprocess.run(
+                lambda p=current_prompt, t=current_timeout: subprocess.run(
                     [CLAUDE_PATH, "--print", "-p", p],
                     capture_output=True, text=True, timeout=t,
                     env=CLI_ENV,
@@ -237,11 +239,12 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
             )
             # stderrがあればログ記録（原因特定用）
             if result.stderr and result.stderr.strip():
-                log.error(f"Claude CLI stderr: {result.stderr[:500]}")
+                log.error(f"Claude CLI stderr (attempt {attempt+1}): {result.stderr[:500]}")
 
             if result.returncode == 0 and result.stdout.strip():
                 _claude_count += 1
                 await _save_brain_counts(_gemini_count, _glm_count, _claude_count)
+                log.info("Claude CLI success.")
                 return (result.stdout.strip(), "Claude CLI")
 
             # "Not logged in" チェック（即座に例外、リトライ不要）
@@ -252,26 +255,33 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
 
             # 詳細なエラーログ（stdout/stderr両方、プロンプト長も）
             stderr_full = result.stderr if result.stderr else "(empty)"
-            log.error(f"Claude CLI attempt {attempt+1}: returncode={result.returncode}, prompt_len={len(prompt)}, timeout={current_timeout}s")
+            log.error(f"Claude CLI attempt {attempt+1}: returncode={result.returncode}, prompt_len={len(current_prompt)}, timeout={current_timeout}s")
             log.error(f"  stdout: {stdout_full[:500]}")
             log.error(f"  stderr: {stderr_full[:500]}")
+
         except subprocess.TimeoutExpired:
             log.error(f"Claude CLI attempt {attempt+1}: timeout ({current_timeout}s)")
             # 3回目のタイムアウトはGeminiにフォールバック
             if attempt == 2:
                 log.warning("Claude CLI 3回タイムアウト、Geminiにフォールバック")
+                # Geminiへのフォールバック時は、元のプロンプトの末尾を使用
+                fallback_prompt = original_prompt[-2000:] if len(original_prompt) > 2000 else original_prompt
                 try:
-                    text, _ = await think_gemini(original_prompt[-2000:] if len(original_prompt) > 2000 else original_prompt)
-                    return (text, "Gemini (Claude fallback)")
+                    text, brain = await think_gemini(fallback_prompt)
+                    log.info(f"Gemini fallback success from Claude CLI timeout.")
+                    return (text, f"{brain} (Claude fallback)")
                 except Exception as e:
                     log.error(f"Gemini fallback failed: {e}")
-                    raise RuntimeError(f"Claude CLI and Gemini both failed: {e}")
+                    raise RuntimeError(f"Claude CLI and Gemini both failed after timeout: {e}")
         except Exception as e:
             log.error(f"Claude CLI attempt {attempt+1}: {e}")
 
+        # リトライ間隔を空ける
         if attempt < 2:
             await asyncio.sleep(sleep_between_retries)
 
+    # 全ての試行で失敗した場合
+    log.error("Claude CLI failed after all attempts.")
     raise RuntimeError(f"Claude CLI failed after 3 attempts (timeouts={timeouts}s)")
 
 # --- 統合思考関数 ---
