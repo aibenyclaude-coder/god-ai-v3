@@ -81,6 +81,11 @@ async def handle_message(client: httpx.AsyncClient, message: str) -> str:
         return await _handle_drive_command()
     if message.strip() == "/queue":
         return format_queue_status()
+    if message.strip().startswith("/tweet "):
+        return await _handle_tweet_command(message[7:].strip())
+    if message.strip().startswith("ツイートして:") or message.strip().startswith("ツイートして："):
+        tweet_text = message.split(":", 1)[1].strip() if ":" in message else message.split("：", 1)[1].strip()
+        return await _handle_tweet_command(tweet_text)
 
     heavy = is_heavy(message)
     identity = load_identity()
@@ -114,6 +119,23 @@ async def _handle_drive_command() -> str:
         return "gdrive.py が見つかりません"
     except Exception as e:
         return f"Driveバックアップエラー: {e}"
+
+async def _handle_tweet_command(tweet_text: str) -> str:
+    try:
+        from twitter import post_tweet, is_configured, get_setup_instructions
+        if not is_configured():
+            return f"Twitter API未設定\n\n{get_setup_instructions()}"
+        if not tweet_text:
+            return "ツイート本文を指定してください\n使い方: /tweet <テキスト>"
+        result = post_tweet(tweet_text)
+        if result["success"]:
+            return f"ツイート投稿完了!\n{result['url']}"
+        else:
+            return f"ツイート投稿失敗\n{result['error']}"
+    except ImportError:
+        return "twitter.py が見つかりません"
+    except Exception as e:
+        return f"ツイートエラー: {e}"
 
 def format_status(state: dict) -> str:
     gemini_count, claude_count = get_brain_counts()
@@ -152,8 +174,12 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                         await tg_send(client, "振り返り中です。しばらくお待ちください。")
                     else:
                         await tg_send(client, "振り返り開始...")
-                        executed = await reflection_cycle(client)
-                        await tg_send(client, "振り返り完了。journalを更新しました。" if executed else "振り返り中のためスキップしました。")
+                        executed, result = await reflection_cycle(client)
+                        if executed:
+                            summary = result[:200] + "..." if len(result) > 200 else result
+                            await tg_send(client, f"振り返り完了。\n\n{summary}")
+                        else:
+                            await tg_send(client, "振り返り中のためスキップしました。")
                     continue
                 pending = await tg_send(client, "...")
                 if not pending:
@@ -213,7 +239,7 @@ async def main():
     log.info(f"Base: {BASE_DIR}")
     log.info("=" * 50)
     async with httpx.AsyncClient() as client:
-        await tg_send(client, "God AI v3.0 起動完了\n/status で状態確認\n/reflect で振り返り\n/drive でDriveバックアップ\n/queue でジョブキュー状態")
+        await tg_send(client, "God AI v3.0 起動完了\n/status で状態確認\n/reflect で振り返り\n/drive でDriveバックアップ\n/queue でジョブキュー状態\n/tweet <テキスト> でツイート投稿")
         def task_done_cb(task: asyncio.Task):
             if task.cancelled(): return
             exc = task.exception()
