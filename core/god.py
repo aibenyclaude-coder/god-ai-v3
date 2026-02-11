@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from dataclasses import dataclass, field
+from enum import IntEnum
 import json
 import logging
 import os
@@ -14,6 +16,8 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Any, Callable, Coroutine
+import uuid
 
 import httpx
 
@@ -29,6 +33,7 @@ BENY_PATH = MEMORY_DIR / "beny.md"
 CONVERSATIONS_PATH = MEMORY_DIR / "conversations.json"
 CONVERSATIONS_ARCHIVE_PATH = MEMORY_DIR / "conversations_archive.json"
 GOD_PY_PATH = CORE_DIR / "god.py"
+PID_FILE = CORE_DIR / "god.pid"
 
 # ─── ログ設定 ───
 logging.basicConfig(
@@ -37,6 +42,35 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("god")
+
+# ─── PIDファイルによる重複プロセス防止 ───
+def check_single_instance():
+    """PIDファイルで重複起動を防止。旧プロセスがあれば自動停止。"""
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            # プロセスが生きてるか確認
+            os.kill(old_pid, 0)
+            # 生きてたら停止
+            log.warning(f"旧プロセス(PID={old_pid})が残存。停止します...")
+            os.kill(old_pid, signal.SIGTERM)
+            import time as _time
+            _time.sleep(3)
+            try:
+                os.kill(old_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            log.info(f"旧プロセス(PID={old_pid})を停止しました")
+        except ProcessLookupError:
+            log.info(f"旧PIDファイルあり(PID={old_pid})だがプロセスは既に終了")
+        except ValueError:
+            log.warning("PIDファイルの内容が不正。削除します。")
+        except Exception as e:
+            log.error(f"旧プロセス確認エラー: {e}")
+
+    # 自分のPIDを書き込み
+    PID_FILE.write_text(str(os.getpid()))
+    log.info(f"PIDファイル作成: {PID_FILE} (PID={os.getpid()})")
 
 # ─── .env読み込み（dotenv不使用） ───
 def load_env(path: Path) -> dict:
@@ -133,6 +167,112 @@ def append_journal(text: str):
     with open(JOURNAL_PATH, "a", encoding="utf-8") as f:
         f.write(f"\n{text}\n")
 
+# ─── ジョブキューシステム ───
+class Priority(IntEnum):
+    """ジョブ優先度（数値が小さいほど高優先度）"""
+    P1_URGENT = 1    # 緊急: 会話応答
+    P2_NORMAL = 2    # 通常: 振り返り
+    P3_BACKGROUND = 3  # 背景: 自己改善
+
+
+@dataclass(order=True)
+class Job:
+    """優先度付きジョブ"""
+    priority: int
+    created_at: float = field(compare=False)
+    job_id: str = field(compare=False)
+    job_type: str = field(compare=False)
+    handler: Callable[..., Coroutine[Any, Any, Any]] = field(compare=False)
+    args: tuple = field(default_factory=tuple, compare=False)
+    kwargs: dict = field(default_factory=dict, compare=False)
+    description: str = field(default="", compare=False)
+
+
+class JobQueue:
+    """asyncio.PriorityQueueベースのジョブキュー"""
+
+    def __init__(self):
+        self._queue: asyncio.PriorityQueue[Job] = asyncio.PriorityQueue()
+        self._current_job: Job | None = None
+        self._completed_count: dict[str, int] = {"P1": 0, "P2": 0, "P3": 0}
+        self._failed_count: int = 0
+
+    async def put(self, job: Job):
+        """ジョブをキューに追加"""
+        await self._queue.put(job)
+        log.info(f"Job queued: {job.job_type} (P{job.priority}) - {job.description}")
+
+    async def get(self) -> Job:
+        """次のジョブを取得（優先度順）"""
+        job = await self._queue.get()
+        self._current_job = job
+        return job
+
+    def task_done(self):
+        """現在のジョブ完了をマーク"""
+        if self._current_job:
+            priority_key = f"P{self._current_job.priority}"
+            self._completed_count[priority_key] = self._completed_count.get(priority_key, 0) + 1
+            self._current_job = None
+        self._queue.task_done()
+
+    def mark_failed(self):
+        """ジョブ失敗をマーク"""
+        self._failed_count += 1
+        self._current_job = None
+
+    def qsize(self) -> int:
+        return self._queue.qsize()
+
+    def get_status(self) -> dict:
+        """キューの状態を返す"""
+        return {
+            "queue_size": self._queue.qsize(),
+            "current_job": {
+                "type": self._current_job.job_type,
+                "priority": f"P{self._current_job.priority}",
+                "description": self._current_job.description,
+            } if self._current_job else None,
+            "completed": self._completed_count.copy(),
+            "failed": self._failed_count,
+        }
+
+
+# グローバルジョブキュー（main()で初期化）
+_job_queue: JobQueue | None = None
+
+
+def get_job_queue() -> JobQueue:
+    """ジョブキューを取得"""
+    global _job_queue
+    if _job_queue is None:
+        _job_queue = JobQueue()
+    return _job_queue
+
+
+async def create_job(
+    priority: Priority,
+    job_type: str,
+    handler: Callable[..., Coroutine[Any, Any, Any]],
+    args: tuple = (),
+    kwargs: dict | None = None,
+    description: str = "",
+) -> str:
+    """ジョブを作成してキューに追加"""
+    job = Job(
+        priority=int(priority),
+        created_at=time.time(),
+        job_id=str(uuid.uuid4())[:8],
+        job_type=job_type,
+        handler=handler,
+        args=args,
+        kwargs=kwargs or {},
+        description=description,
+    )
+    await get_job_queue().put(job)
+    return job.job_id
+
+
 # ─── asyncio.Lock（並行書き込み保護）───
 _write_lock: asyncio.Lock | None = None
 
@@ -223,7 +363,7 @@ async def think_claude(prompt: str) -> tuple[str, str]:
                 None,
                 lambda: subprocess.run(
                     ["claude", "--print", "-p", prompt],
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True, text=True, timeout=280,
                 ),
             )
             if result.returncode == 0 and result.stdout.strip():
@@ -231,12 +371,12 @@ async def think_claude(prompt: str) -> tuple[str, str]:
                 return (result.stdout.strip(), "Claude CLI")
             log.error(f"Claude CLI attempt {attempt+1}: returncode={result.returncode}, stderr={result.stderr[:200]}")
         except subprocess.TimeoutExpired:
-            log.error(f"Claude CLI attempt {attempt+1}: timeout (120s)")
+            log.error(f"Claude CLI attempt {attempt+1}: timeout (280s)")
         except Exception as e:
             log.error(f"Claude CLI attempt {attempt+1}: {e}")
         if attempt < 2:
             await asyncio.sleep(3)
-    raise RuntimeError("Claude CLI failed after 3 attempts (timeout=120s)")
+    raise RuntimeError("Claude CLI failed after 3 attempts (timeout=280s)")
 
 async def think_claude_heavy(prompt: str) -> tuple[str, str]:
     """Claude CLIで重い処理（自己改善用、タイムアウト280秒、リトライ強化）。戻り値: (テキスト, 脳の名前)"""
@@ -285,6 +425,10 @@ async def handle_message(client: httpx.AsyncClient, message: str) -> str:
         return format_status(state)
     if message.strip() == "/reflect":
         return "振り返り開始..."  # 実行は呼び出し元で
+    if message.strip() == "/drive":
+        return await _handle_drive_command()
+    if message.strip() == "/queue":
+        return format_queue_status()
 
     heavy = is_heavy(message)
     system_prompt = f"""あなたはGod AI。Benyのために存在する自律型AI。
@@ -302,6 +446,44 @@ async def handle_message(client: httpx.AsyncClient, message: str) -> str:
 
     response_text, brain_name = await think(system_prompt, heavy=heavy)
     return f"{response_text}\n\n🧠 {brain_name}"
+
+async def _handle_drive_command() -> str:
+    """Google Driveにjournalとstate等をバックアップ"""
+    try:
+        from gdrive import upload_file, is_configured
+        if not is_configured():
+            return "❌ Google Drive未設定\nclient_secret.json を core/ に配置してください"
+        results = []
+        for path, desc in [
+            (JOURNAL_PATH, "journal.md"),
+            (STATE_PATH, "state.json"),
+            (IDENTITY_PATH, "identity.md"),
+            (GOD_PY_PATH, "god.py"),
+        ]:
+            r = upload_file(str(path))
+            if r:
+                results.append(f"✅ {desc}")
+            else:
+                results.append(f"❌ {desc} 失敗")
+        return f"📁 Google Drive バックアップ\n" + "\n".join(results)
+    except ImportError:
+        return "❌ gdrive.py が見つかりません"
+    except Exception as e:
+        return f"❌ Driveバックアップエラー: {e}"
+
+
+async def _drive_backup_silent():
+    """振り返り後の自動バックアップ（エラーは静かにログ）"""
+    try:
+        from gdrive import upload_file, is_configured
+        if not is_configured():
+            return
+        upload_file(str(JOURNAL_PATH))
+        upload_file(str(STATE_PATH))
+        log.info("Drive自動バックアップ完了")
+    except Exception as e:
+        log.debug(f"Drive自動バックアップスキップ: {e}")
+
 
 def format_status(state: dict) -> str:
     uptime = "不明"
@@ -321,6 +503,31 @@ def format_status(state: dict) -> str:
         f"子AI数: {state.get('children_count', 0)}\n"
         f"Gemini使用: {gemini_count}回\n"
         f"Claude使用: {claude_count}回"
+    )
+
+
+def format_queue_status() -> str:
+    """ジョブキューの状態をフォーマット"""
+    queue = get_job_queue()
+    status = queue.get_status()
+
+    current_job_str = "なし"
+    if status["current_job"]:
+        cj = status["current_job"]
+        current_job_str = f"{cj['type']} ({cj['priority']})"
+
+    completed = status["completed"]
+    return (
+        f"📋 Job Queue Status\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"待機中ジョブ: {status['queue_size']}件\n"
+        f"実行中: {current_job_str}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"完了済み:\n"
+        f"  P1 (緊急/会話): {completed.get('P1', 0)}件\n"
+        f"  P2 (通常/振り返り): {completed.get('P2', 0)}件\n"
+        f"  P3 (背景/自己改善): {completed.get('P3', 0)}件\n"
+        f"失敗: {status['failed']}件"
     )
 
 # ─── コード構文検証関数（強化版）───
@@ -432,6 +639,9 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient):
     state["growth_cycles"] = state.get("growth_cycles", 0) + 1
     state["last_reflection"] = now
     await safe_save_state(state)
+
+    # Google Driveバックアップ（設定済みなら）
+    await _drive_backup_silent()
 
     # コード改善提案チェック
     if "CODE_IMPROVEMENT:" in reflection:
@@ -745,6 +955,105 @@ async def reflection_scheduler(client: httpx.AsyncClient):
             append_journal(f"### {datetime.now().strftime('%H:%M')} 定期振り返りエラー\n{e}")
             await asyncio.sleep(10)
 
+
+# ─── ジョブワーカー ───
+async def job_worker(client: httpx.AsyncClient):
+    """ジョブキューからジョブを取得して実行"""
+    log.info("ジョブワーカー開始")
+    queue = get_job_queue()
+
+    while True:
+        try:
+            job = await queue.get()
+            log.info(f"ジョブ実行開始: {job.job_type} (P{job.priority}) - {job.description}")
+
+            try:
+                await job.handler(*job.args, **job.kwargs)
+                queue.task_done()
+                log.info(f"ジョブ完了: {job.job_type}")
+            except Exception as e:
+                queue.mark_failed()
+                log.error(f"ジョブ失敗: {job.job_type} - {e}", exc_info=True)
+                append_journal(f"### {datetime.now().strftime('%H:%M')} ジョブ失敗: {job.job_type}\n{e}")
+
+        except asyncio.CancelledError:
+            log.info("ジョブワーカー: キャンセルされました")
+            raise
+        except Exception as e:
+            log.error(f"ジョブワーカーエラー: {e}", exc_info=True)
+            await asyncio.sleep(5)
+
+
+# ─── 自己成長提案スケジューラ ───
+SELF_GROWTH_INTERVAL = 600  # 秒（10分）
+
+async def _self_growth_job(client: httpx.AsyncClient):
+    """自己成長提案ジョブの実行"""
+    log.info("自己成長提案ジョブ開始")
+    state = load_state()
+    journal_tail = read_file(JOURNAL_PATH, tail=30)
+
+    prompt = f"""あなたはGod AI。自律型AIとして自己成長を提案せよ。
+
+【現在の状態】
+{json.dumps(state, ensure_ascii=False)}
+
+【最近のjournal】
+{journal_tail}
+
+【タスク】
+以下の観点で自己成長提案を1つだけ挙げよ：
+1. 新しい機能追加の提案
+2. パフォーマンス改善の提案
+3. コード品質向上の提案
+4. ユーザー体験改善の提案
+
+簡潔に日本語で提案せよ。
+実装可能な具体的提案を「GROWTH_PROPOSAL:」で始まる行に書け。"""
+
+    try:
+        proposal, brain_name = await think_gemini(prompt)
+
+        # journalに記録
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        await safe_append_journal(f"### {now} 自己成長提案 (🧠 {brain_name})\n{proposal}")
+
+        # 提案があればログに記録
+        if "GROWTH_PROPOSAL:" in proposal:
+            for line in proposal.splitlines():
+                if line.strip().startswith("GROWTH_PROPOSAL:"):
+                    prop = line.strip().replace("GROWTH_PROPOSAL:", "").strip()
+                    log.info(f"自己成長提案: {prop}")
+
+        log.info("自己成長提案ジョブ完了")
+
+    except Exception as e:
+        log.error(f"自己成長提案失敗: {e}")
+
+
+async def self_growth_scheduler(client: httpx.AsyncClient):
+    """10分ごとに自己成長提案をP3としてキューに登録"""
+    log.info(f"自己成長スケジューラ開始 (間隔: {SELF_GROWTH_INTERVAL}秒)")
+    await asyncio.sleep(60)  # 起動後60秒待ってから開始
+
+    while True:
+        try:
+            await create_job(
+                priority=Priority.P3_BACKGROUND,
+                job_type="self_growth",
+                handler=_self_growth_job,
+                args=(client,),
+                description="自己成長提案の生成",
+            )
+            log.info("自己成長ジョブをキューに追加")
+            await asyncio.sleep(SELF_GROWTH_INTERVAL)
+        except asyncio.CancelledError:
+            log.info("自己成長スケジューラ: キャンセルされました")
+            raise
+        except Exception as e:
+            log.error(f"自己成長スケジューラエラー: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
 # ─── シグナルハンドラ（フラグ方式）───
 _shutdown_flag = False
 
@@ -752,6 +1061,13 @@ def handle_signal(sig, frame):
     global _shutdown_flag
     _shutdown_flag = True
     log.info(f"Signal {sig} received, shutdown flag set")
+    # PIDファイル削除
+    try:
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+            log.info("PIDファイル削除完了")
+    except Exception as e:
+        log.error(f"PIDファイル削除失敗: {e}")
 
 # ─── 致命的エラー通知（同期 / メインループ外で使用）───
 def notify_fatal_error(message: str):
@@ -767,8 +1083,11 @@ def notify_fatal_error(message: str):
 
 # ─── メイン ───
 async def main():
-    global STATE, _write_lock
+    global STATE, _write_lock, _job_queue
     _write_lock = asyncio.Lock()
+    _job_queue = JobQueue()
+
+    check_single_instance()
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -784,12 +1103,13 @@ async def main():
     log.info(f"Base: {BASE_DIR}")
     log.info(f"Gemini: Ready")
     log.info(f"Claude CLI: Ready")
+    log.info(f"Job Queue: Ready")
     log.info(f"Telegram: Polling...")
     log.info("=" * 50)
 
     async with httpx.AsyncClient() as client:
         # 起動通知
-        await tg_send(client, "🧠 God AI v3.0 起動完了\n脳: Gemini（日常） + Claude CLI（重い処理）\n/status で状態確認\n/reflect で即座に振り返り")
+        await tg_send(client, "🧠 God AI v3.0 起動完了\n脳: Gemini（日常） + Claude CLI（重い処理）\n/status で状態確認\n/reflect で即座に振り返り\n/drive でGoogle Driveバックアップ\n/queue でジョブキュー状態確認")
 
         # タスク起動（例外を検知するコールバック付き）
         def task_done_callback(task: asyncio.Task):
@@ -804,8 +1124,12 @@ async def main():
         poll_task.add_done_callback(task_done_callback)
         reflect_task = asyncio.create_task(reflection_scheduler(client), name="reflection")
         reflect_task.add_done_callback(task_done_callback)
+        worker_task = asyncio.create_task(job_worker(client), name="job_worker")
+        worker_task.add_done_callback(task_done_callback)
+        growth_task = asyncio.create_task(self_growth_scheduler(client), name="self_growth")
+        growth_task.add_done_callback(task_done_callback)
 
-        log.info("タスク起動完了: polling, reflection")
+        log.info("タスク起動完了: polling, reflection, job_worker, self_growth")
 
         # シャットダウン待ち（フラグ方式）
         while not _shutdown_flag:
@@ -814,11 +1138,20 @@ async def main():
         log.info("Shutting down...")
         poll_task.cancel()
         reflect_task.cancel()
+        worker_task.cancel()
+        growth_task.cancel()
 
         await tg_send(client, "⏹️ God AI v3.0 停止します")
 
         STATE["status"] = "stopped"
         save_state(STATE)
+
+        # PIDファイル削除
+        try:
+            if PID_FILE.exists():
+                PID_FILE.unlink()
+        except Exception:
+            pass
 
     log.info("God AI v3.0 停止完了")
 

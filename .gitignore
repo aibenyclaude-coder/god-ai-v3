@@ -1,5 +1,11 @@
 # Secrets
 core/.env
+core/client_secret*.json
+core/client_secret.json
+core/token.json
+core/drive_token.json
+core/credentials*.json
+core/drive_folder_id.txt
 
 # Backups
 *.bak
