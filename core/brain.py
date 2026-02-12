@@ -371,6 +371,20 @@ async def think(prompt: str, heavy: bool = False, bias_to_x_lp: bool = False) ->
         remaining = get_ai_pause_remaining()
         raise AIUnavailable(f"AI is currently paused (remaining {remaining} seconds).")
 
+    # Auto-detect LP/landing page/copywriting tasks and upgrade to heavy mode
+    # Claude CLI produces higher-quality long-form content for these tasks
+    if not heavy:
+        lp_task_keywords = [
+            "landing page", "lp", "copywriting", "sales copy",
+            "persuasive", "conversion", "headline", "cta",
+            "call to action", "lead magnet", "sales letter",
+            "product description", "service page",
+        ]
+        prompt_lower = prompt.lower()
+        if any(kw in prompt_lower for kw in lp_task_keywords):
+            heavy = True
+            log.info("LP/copywriting task detected in prompt, upgrading to heavy mode (Claude CLI) for better quality.")
+
     # Prepend instruction if bias_to_x_lp is True
     if bias_to_x_lp:
         x_lp_instruction = (
