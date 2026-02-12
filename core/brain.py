@@ -518,7 +518,7 @@ async def think(prompt: str, heavy: bool = False, bias_to_x_lp: bool = False) ->
     except Exception as e:
         log.warning(f"Failed to check revenue goal status: {e}")
 
-    # Auto-detect LP/landing page/copywriting tasks and upgrade to heavy mode
+    # Auto-detect LP/landing page/copywriting tasks and upgrade to heavy mode if not already set
     # Claude CLI produces higher-quality long-form content for these tasks
     if not heavy:
         lp_task_keywords = [
