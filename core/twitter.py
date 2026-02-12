@@ -61,6 +61,11 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
             - url: str (on success)
             - error: str (on failure)
     """
+    import time
+    import logging
+
+    log = logging.getLogger("god.twitter")
+
     if not text or not text.strip():
         return {"success": False, "error": "Tweet body is empty"}
 
@@ -77,32 +82,62 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
     # Append call-to-action with Coconala link if not already present
     coconala_url = "https://coconala.com/services/4072452"
     cta_suffix = f"\n\nLP made by AI: {coconala_url}"
-    
+
     # Check if adding CTA exceeds the limit only if no media is present or if it's short
     if len(text) + len(cta_suffix) > 280 and (not media or len(text) <= 280 - len(cta_suffix)):
         # If text is already long, and we have media, we might not be able to add CTA.
         # Prioritize posting the content and media.
-        pass 
+        pass
     elif coconala_url not in text:
         text = text.rstrip() + cta_suffix
 
     try:
         client = get_client()
-        
+
         # Handle media upload if provided
         media_ids = None
         if media:
             media_upload_response = client.upload_media(media, media_category="tweet_image")
             media_ids = media_upload_response.data["media_id"]
 
-        response = client.create_tweet(text=text, media_ids=media_ids)
-        
-        tweet_id = response.data["id"]
-        return {
-            "success": True,
-            "tweet_id": tweet_id,
-            "url": f"https://twitter.com/i/web/status/{tweet_id}"
-        }
+        # Retry with exponential backoff for transient errors
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                response = client.create_tweet(text=text, media_ids=media_ids)
+                tweet_id = response.data["id"]
+                return {
+                    "success": True,
+                    "tweet_id": tweet_id,
+                    "url": f"https://twitter.com/i/web/status/{tweet_id}"
+                }
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                # Non-transient errors: fail immediately without retry
+                if any(keyword in error_str for keyword in [
+                    "unauthorized", "forbidden", "authentication",
+                    "invalid", "401", "403", "not found", "404"
+                ]):
+                    log.error("Non-transient Twitter API error, not retrying: %s", e)
+                    return {"success": False, "error": f"Tweet post error: {e}"}
+
+                # Transient errors (rate limit, server error): retry with backoff
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    log.warning(
+                        "Transient Twitter API error (attempt %d/%d), retrying in %ds: %s",
+                        attempt + 1, max_retries, wait_time, e
+                    )
+                    time.sleep(wait_time)
+                else:
+                    log.error(
+                        "Twitter API error after %d attempts: %s",
+                        max_retries, e
+                    )
+
+        return {"success": False, "error": f"Tweet post error after {max_retries} attempts: {last_error}"}
     except ImportError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
