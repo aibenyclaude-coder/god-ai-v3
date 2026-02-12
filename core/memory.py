@@ -44,33 +44,43 @@ def load_state() -> dict:
     """
     Loads the AI's state from the state file.
     If the file is not found or corrupted, returns a default state.
+    Attempts to restore from backup if available.
     """
-    try:
-        state_content = STATE_PATH.read_text(encoding="utf-8")
-        return json.loads(state_content)
-    except FileNotFoundError:
-        log.warning(f"State file not found at {STATE_PATH}. Returning default state.")
+    global MEMORY_DIR # Ensure MEMORY_DIR is accessible
+    state_path = STATE_PATH
+    memory_dir = MEMORY_DIR # Use local variable for clarity
+
+    if not state_path.exists():
+        log.warning(f"State file not found at {state_path}. Attempting to restore from backup.")
         # Check if MEMORY_DIR is defined before attempting to create a backup path
-        if 'MEMORY_DIR' in globals() and MEMORY_DIR is not None:
-            backup_path = MEMORY_DIR / "state.json.bak"
+        if memory_dir is not None:
+            backup_path = memory_dir / "state.json.bak"
             if backup_path.exists():
                 log.info(f"Restoring state from backup: {backup_path}")
                 try:
                     return json.loads(backup_path.read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, FileNotFoundError) as e:
                     log.error(f"Failed to restore state from backup {backup_path}: {e}")
+        
+        # If no backup or backup failed, return default state
+        log.info("Returning default state.")
         return {"status": "unknown", "current_task": None, "last_reflection": None,
                 "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
+    
+    try:
+        state_content = state_path.read_text(encoding="utf-8")
+        return json.loads(state_content)
     except json.JSONDecodeError:
-        log.error(f"State file at {STATE_PATH} is corrupted. Attempting recovery.")
-        # Attempt to recover by creating a default state and logging the error
+        log.error(f"State file at {state_path} is corrupted. Attempting recovery.")
+        # Attempt to recover by creating a backup and returning a default state
         try:
             # Create a backup of the corrupted file with a timestamp
-            corrupted_state_content = STATE_PATH.read_text(encoding="utf-8")
-            # Ensure MEMORY_DIR is defined before creating backup path
-            if 'MEMORY_DIR' in globals() and MEMORY_DIR is not None:
-                backup_filename = f"state.json.corrupted.{datetime.now(timezone.utc).isoformat().replace(':', '-')}.bak"
-                backup_path = MEMORY_DIR / backup_filename
+            corrupted_state_content = state_path.read_text(encoding="utf-8")
+            if memory_dir is not None:
+                # Construct backup filename safely
+                timestamp = datetime.now(timezone.utc).isoformat().replace(':', '-').replace('+', '_')
+                backup_filename = f"state.json.corrupted.{timestamp}.bak"
+                backup_path = memory_dir / backup_filename
                 backup_path.write_text(corrupted_state_content, encoding="utf-8")
                 log.info(f"Corrupted state file backed up to {backup_path}")
             else:
@@ -78,10 +88,11 @@ def load_state() -> dict:
         except Exception as e:
             log.error(f"Failed to create backup of corrupted state file: {e}")
 
+        log.info("Returning default state after corruption.")
         return {"status": "unknown", "current_task": None, "last_reflection": None,
                 "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
     except Exception as e:
-        log.error(f"An unexpected error occurred while loading state from {STATE_PATH}: {e}")
+        log.error(f"An unexpected error occurred while loading state from {state_path}: {e}")
         return {"status": "unknown", "current_task": None, "last_reflection": None,
                 "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
 
