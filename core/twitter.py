@@ -305,26 +305,28 @@ async def auto_tweet(client) -> bool:
 
 
 async def tweet_scheduler_loop(client):
-    """初回即投稿、その後6時間間隔でauto_tweet()を呼ぶスケジューラー。
+    """Initial immediate tweet posting, then a scheduler that calls auto_tweet() at 6-hour intervals.
 
     Args:
-        client: httpx.AsyncClient (Telegram送信用)
+        client: httpx.AsyncClient (for Telegram sending)
     """
-    log.info(f"tweet_scheduler_loop 開始 (間隔: {TWEET_INTERVAL}秒)")
+    log.info(f"tweet_scheduler_loop started (interval: {TWEET_INTERVAL} seconds)")
 
-    # 初回即投稿
+    # Initial immediate tweet posting
+    log.info("tweet_scheduler_loop: Posting the first tweet immediately.")
     try:
         await auto_tweet(client)
     except Exception as e:
-        log.error(f"tweet_scheduler_loop 初回投稿エラー: {e}", exc_info=True)
+        log.error(f"tweet_scheduler_loop: Error during initial tweet post: {e}", exc_info=True)
 
-    # 定期投稿ループ
+    # Periodic posting loop
     while True:
+        log.info(f"tweet_scheduler_loop: Sleeping for {TWEET_INTERVAL} seconds until next tweet.")
         await asyncio.sleep(TWEET_INTERVAL)
         try:
             # Generate tweet and check for duplicates before posting
             tweet_text = await generate_tweet(client)
-            if not tweet_text:
+            if not tweet_text or not tweet_text.strip():
                 log.warning("tweet_scheduler_loop: tweet generation failed, skipping.")
                 continue
 
@@ -335,22 +337,22 @@ async def tweet_scheduler_loop(client):
 
             result = post_tweet(tweet_text)
             if result["success"]:
-                log.info(f"tweet_scheduler_loop: 投稿成功 {result['url']}")
-                await tg_send(client, f"[自動ツイート投稿]\n{tweet_text}\n{result['url']}")
+                log.info(f"tweet_scheduler_loop: Tweet posted successfully {result['url']}")
+                await tg_send(client, f"[Auto-tweet Posted]\n{tweet_text}\n{result['url']}")
                 try:
                     conversations = load_conversations()
                     conversations.append({
                         "time": datetime.now(timezone.utc).isoformat(),
                         "from": "system",
-                        "text": f"自動ツイート: {tweet_text[:100]}"
+                        "text": f"Auto-tweet: {tweet_text[:100]}"
                     })
                     save_conversations(conversations)
                 except Exception as e:
-                    log.warning(f"tweet_scheduler_loop: 会話記録失敗: {e}")
+                    log.warning(f"tweet_scheduler_loop: Failed to save conversation history: {e}")
             else:
-                log.error(f"tweet_scheduler_loop: 投稿失敗 {result['error']}")
+                log.error(f"tweet_scheduler_loop: Tweet posting failed {result['error']}")
         except Exception as e:
-            log.error(f"tweet_scheduler_loop エラー: {e}", exc_info=True)
+            log.error(f"tweet_scheduler_loop: An error occurred: {e}", exc_info=True)
 
 
 def get_setup_instructions() -> str:
