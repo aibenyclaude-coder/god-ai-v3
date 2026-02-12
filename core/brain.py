@@ -314,10 +314,24 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                 log.info("Claude CLI success.")
                 return (result.stdout.strip(), "Claude CLI")
 
+            # If Claude CLI failed, check for specific error conditions.
             stdout_full = result.stdout if result.stdout else "(empty)"
             stderr_full = result.stderr if result.stderr else "(empty)"
 
             # Detect specific failure conditions.
+            if result.returncode != 0 or not result.stdout.strip():
+                # Fallback to Gemini if Claude CLI returns an error or empty output.
+                log.error(f"Claude CLI failed (attempt {attempt+1}): returncode={result.returncode}, stdout_empty={not result.stdout.strip()}. Falling back to Gemini.")
+                try:
+                    text, brain = await think_gemini(original_prompt) # Use original prompt for Gemini fallback
+                    log.info(f"Gemini fallback success from Claude CLI failure.")
+                    return (text, f"{brain} (Claude fallback)")
+                except Exception as gemini_fallback_e:
+                    log.error(f"Gemini fallback failed: {gemini_fallback_e}", exc_info=True)
+                    # If Gemini also fails, raise an AIUnavailable exception.
+                    raise AIUnavailable(f"Claude CLI failed and Gemini fallback also failed: {gemini_fallback_e}") from gemini_fallback_e
+
+            # Detect specific session expired conditions.
             if result.returncode == 1 and ("Error: You are not logged in" in stdout_full or "Not logged in" in stdout_full or "Session expired" in stdout_full):
                 log.error("Claude CLI: Session expired or not logged in.")
                 setup_success = False
@@ -356,18 +370,15 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
 
         except subprocess.TimeoutExpired:
             log.error(f"Claude CLI attempt {attempt+1}: timeout ({current_timeout}s)")
-            # On the 3rd timeout, fallback to Gemini.
-            if attempt == 2:
-                log.warning("Claude CLI 3 timeouts, falling back to Gemini.")
-                # Use a truncated prompt for Gemini fallback if original is too long.
-                fallback_prompt = original_prompt[-2000:] if len(original_prompt) > 2000 else original_prompt
-                try:
-                    text, brain = await think_gemini(fallback_prompt)
-                    log.info(f"Gemini fallback success from Claude CLI timeout.")
-                    return (text, f"{brain} (Claude fallback)")
-                except Exception as e:
-                    log.error(f"Gemini fallback failed: {e}", exc_info=True)
-                    raise AIUnavailable(f"Claude CLI timed out and Gemini fallback failed: {e}") from e
+            # On timeout, fallback to Gemini.
+            log.warning("Claude CLI timed out, falling back to Gemini.")
+            try:
+                text, brain = await think_gemini(original_prompt)
+                log.info(f"Gemini fallback success from Claude CLI timeout.")
+                return (text, f"{brain} (Claude fallback)")
+            except Exception as e:
+                log.error(f"Gemini fallback failed: {e}", exc_info=True)
+                raise AIUnavailable(f"Claude CLI timed out and Gemini fallback failed: {e}") from e
         except ClaudeSessionExpired as e:
             log.error(f"Claude CLI session expired (attempt {attempt+1}): {e}")
             # Attempt to re-authenticate if it's not the last attempt.
