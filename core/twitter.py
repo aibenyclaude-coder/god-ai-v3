@@ -63,7 +63,7 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
     """
     import time
     import logging
-    import re  # Import the regular expression module
+    import re
 
     log = logging.getLogger("god.twitter")
 
@@ -81,10 +81,8 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
         }
 
     # --- Improvement: Check for duplicate tweets ---
-    # In a real scenario, tweet_history would be loaded from a persistent storage
-    # For demonstration, assuming tweet_history is accessible and contains tweet texts
-    # This is a placeholder for actual history retrieval logic
-    tweet_history = get_tweet_history()  # Assume this function exists and returns a list of strings
+    # Retrieve the history of recently posted tweet texts.
+    tweet_history = get_tweet_history()
     if text in tweet_history:
         return {"success": False, "error": "Duplicate tweet detected. This tweet has already been posted."}
     # --- End Improvement ---
