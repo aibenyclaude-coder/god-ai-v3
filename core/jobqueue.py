@@ -84,63 +84,70 @@ def is_p1_interrupted() -> bool:
 def load_queue() -> list[dict]:
     """job_queue.json からジョブ一覧を読み込む。
     整合性チェックを強化し、不正なエントリはログに記録して除外する。
+    `init_job_queue` が呼ばれる前に `_p1_interrupt_event` が None であっても
+    NameError を捕捉して処理を継続できるようにする。
     """
+    global _p1_interrupt_event
+    if _p1_interrupt_event is None:
+        log.warning("P1 interrupt event not initialized. Initializing now.")
+        _p1_interrupt_event = asyncio.Event()
+
     if JOB_QUEUE_PATH.exists():
         try:
             data = json.loads(JOB_QUEUE_PATH.read_text(encoding="utf-8"))
             if not isinstance(data, list):
-                log.warning(f"ジョブキューのフォーマットが不正です: {JOB_QUEUE_PATH}")
+                log.warning(f"Job queue format is invalid: {JOB_QUEUE_PATH}")
                 return []
 
             valid_jobs = []
             for i, job in enumerate(data):
                 if not isinstance(job, dict):
-                    log.warning(f"ジョブキューの {i} 番目のエントリは不正な型です: {job}")
+                    log.warning(f"Job queue entry {i} has invalid type: {job}")
                     continue
 
-                # 必須キーのチェック
+                # Check for required keys
                 required_keys = ["task_id", "type", "priority", "status", "input", "output", "meta"]
                 if not all(key in job for key in required_keys):
-                    log.warning(f"ジョブキューの {i} 番目のエントリに必要なキーが不足しています: {job.get('task_id', 'N/A')}")
+                    log.warning(f"Job queue entry {i} is missing required keys: {job.get('task_id', 'N/A')}")
                     continue
 
-                # input内の必須キーチェック
+                # Check for required keys within input
                 input_job = job.get("input", {})
                 if not all(key in input_job for key in ["target_file", "read_files", "instruction", "constraints"]):
-                    log.warning(f"ジョブキューの {i} 番目のエントリの input に必要なキーが不足しています: {job.get('task_id', 'N/A')}")
+                    log.warning(f"Job queue entry {i}'s input is missing required keys: {job.get('task_id', 'N/A')}")
                     continue
 
-                # meta内の必須キーチェック
+                # Check for required keys within meta
                 meta_job = job.get("meta", {})
                 if not all(key in meta_job for key in ["created_at", "estimated_seconds", "retry_count", "max_retries", "error_history"]):
-                    log.warning(f"ジョブキューの {i} 番目のエントリの meta に必要なキーが不足しています: {job.get('task_id', 'N/A')}")
+                    log.warning(f"Job queue entry {i}'s meta is missing required keys: {job.get('task_id', 'N/A')}")
                     continue
 
-                # 型チェック (一部)
+                # Type checking (partial)
                 if not isinstance(job["task_id"], str) or not isinstance(job["type"], str) or not isinstance(job["priority"], str) or not isinstance(job["status"], str):
-                    log.warning(f"ジョブキューの {i} 番目のエントリの必須文字列フィールドの型が不正です: {job.get('task_id', 'N/A')}")
+                    log.warning(f"Job queue entry {i}'s required string fields have invalid types: {job.get('task_id', 'N/A')}")
                     continue
                 if not isinstance(job["input"].get("read_files"), list) or not isinstance(job["input"].get("instruction"), str) or not isinstance(job["input"].get("constraints"), list):
-                    log.warning(f"ジョブキューの {i} 番目のエントリの input フィールドの型が不正です: {job.get('task_id', 'N/A')}")
+                    log.warning(f"Job queue entry {i}'s input fields have invalid types: {job.get('task_id', 'N/A')}")
                     continue
                 if not isinstance(job["meta"].get("error_history"), list):
-                    log.warning(f"ジョブキューの {i} 番目のエントリの meta.error_history の型が不正です: {job.get('task_id', 'N/A')}")
+                    log.warning(f"Job queue entry {i}'s meta.error_history has invalid type: {job.get('task_id', 'N/A')}")
                     continue
 
                 valid_jobs.append(job)
 
             if len(valid_jobs) < len(data):
-                # 整形して保存し直すことで、不正なエントリを削除
+                # Resave with formatting to remove invalid entries
                 save_queue(valid_jobs)
 
             return valid_jobs
 
         except json.JSONDecodeError as e:
-            log.warning(f"ジョブキューのJSONデコード失敗: {e} in {JOB_QUEUE_PATH}")
+            log.warning(f"Failed to decode job queue JSON: {e} in {JOB_QUEUE_PATH}")
         except FileNotFoundError:
-            pass  # ファイルが存在しない場合は空リストを返す
+            pass  # Return empty list if file doesn't exist
         except Exception as e:
-            log.error(f"ジョブキュー読み込み中に予期せぬエラー: {e}", exc_info=True)
+            log.error(f"Unexpected error loading job queue: {e}", exc_info=True)
 
     return []
 
