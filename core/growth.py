@@ -847,15 +847,15 @@ async def run_post_improvement_tests(
 
 # --- コード構文検証関数 ---
 def validate_code_syntax(code: str) -> tuple[bool, str]:
-    """生成コードの構文を厳密に検証。戻り値: (有効かどうか, エラーメッセージ)
-    Pythonの構文として不正な全角文字（例: 【, 】）の混入も検知する。
+    """Generate code syntax validation. Returns: (is_valid, error_message)
+    Also detects invalid full-width characters (e.g., 【, 】) in generated code.
     """
-    # 全角記号（ brackets, quotes etc.）をチェック
+    # Detect invalid full-width characters in the code.
     # This set includes common full-width punctuation and brackets.
-    fullwidth_chars = re.compile(r'[【】『』（）《》「」〔〕、。！？：；]')
-    match = fullwidth_chars.search(code)
+    fullwidth_chars_pattern = re.compile(r'[【】『』（）《》「」〔〕、。！？：；]')
+    match = fullwidth_chars_pattern.search(code)
     if match:
-        # Find the line number and context for the invalid character
+        # Find the line number and context for the invalid character.
         error_line_num = code.count('\n', 0, match.start()) + 1
         lines = code.splitlines()
         start = max(0, error_line_num - 3)
@@ -864,11 +864,13 @@ def validate_code_syntax(code: str) -> tuple[bool, str]:
         return (False, f"Invalid full-width character '{match.group(0)}' found at line {error_line_num}. Check code context:\n{context}")
 
     try:
+        # Attempt to parse the code as Python syntax.
         ast.parse(code)
         return (True, "")
     except SyntaxError as e:
+        # Handle Python syntax errors.
         error_msg = f"SyntaxError at line {e.lineno}, col {e.offset}: {e.msg}"
-        if e.lineno:
+        if e.lineno and e.lineno <= len(code.splitlines()):
             lines = code.splitlines()
             start = max(0, e.lineno - 3)
             end = min(len(lines), e.lineno + 2)
@@ -876,7 +878,8 @@ def validate_code_syntax(code: str) -> tuple[bool, str]:
             error_msg += f"\nCode context:\n{context}"
         return (False, error_msg)
     except Exception as e:
-        return (False, f"Unexpected error: {e}")
+        # Handle any other unexpected errors during parsing.
+        return (False, f"Unexpected error during syntax validation: {e}")
 
 # --- 差分パッチ適用関数 ---
 def parse_patches(result_text: str) -> list[tuple[str, str]]:
