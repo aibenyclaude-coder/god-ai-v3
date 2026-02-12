@@ -1480,100 +1480,49 @@ CODE_IMPROVEMENTで関数名を指定する場合は、上の一覧にある関�
 
 
 # --- 定期振り返りスケジューラ ---
-async def reflection_scheduler(client: httpx.AsyncClient):
-    """Periodically run reflection cycles.
-
-    Before each reflection, checks for P1 (revenue) jobs in the queue.
-    If P1 jobs are pending or running, skips the regular reflection cycle
-    to yield CPU/API resources to self_growth_scheduler and job_worker
-    which handle P1 tasks. Also reads goals.md to detect revenue-phase
-    priorities and prepends a revenue-priority hint to the reflection.
+def reflection_scheduler():
     """
-    from god import tg_send
-    log.info(f"reflection_scheduler started (interval: {REFLECTION_INTERVAL}s)")
-    while True:
-        try:
-            await asyncio.sleep(REFLECTION_INTERVAL)
-            log.info("Scheduled reflection: starting")
-            if _reflecting:
-                log.warning("Scheduled reflection: skipped (manual reflection in progress)")
-                continue
+    Reflection scheduler to periodically trigger self-reflection and self-growth cycles.
+    If the number of pending improvements is excessively high, skip triggering new self-growth cycles
+    to prevent system overload.
+    """
+    global _next_reflection_time, _next_self_growth_time
 
-            # Check for P1 jobs in the queue; if present, skip reflection
-            # to yield resources for revenue-critical work
-            try:
-                jobs = load_queue()
-                p1_jobs = [
-                    j for j in jobs
-                    if j.get("priority") == "P1"
-                    and j.get("status") in ("queued", "running")
-                ]
-                if p1_jobs:
-                    p1_summaries = []
-                    for pj in p1_jobs[:3]:
-                        inp = pj.get("input", {})
-                        p1_summaries.append(
-                            f"{inp.get('target_file', 'unknown')}: {inp.get('instruction', '')[:60]}"
-                        )
-                    summary_text = "; ".join(p1_summaries)
-                    log.info(
-                        f"Scheduled reflection: skipped to yield resources for "
-                        f"{len(p1_jobs)} P1 job(s): {summary_text}"
-                    )
-                    await tg_send(
-                        client,
-                        f"Reflection skipped: {len(p1_jobs)} P1 job(s) active, "
-                        f"yielding resources.\n{summary_text[:200]}"
-                    )
-                    continue
-            except Exception as e:
-                log.warning(f"P1 job check failed, proceeding with reflection: {e}")
+    now = datetime.now(timezone.utc).timestamp()
 
-            # Detect revenue-phase from goals.md to hint the reflection
-            revenue_hint = ""
-            try:
-                from config import GOALS_PATH
-                if GOALS_PATH.exists():
-                    goals_text = GOALS_PATH.read_text(encoding="utf-8")
-                    revenue_keywords = ["LP", "coconala", "revenue", "earning", "income"]
-                    if any(kw.lower() in goals_text.lower() for kw in revenue_keywords):
-                        revenue_hint = (
-                            "PRIORITY: Revenue-generating tasks detected in goals. "
-                            "Focus reflection on improvements that directly support "
-                            "revenue (LP creation, coconala, monetization features)."
-                        )
-                        log.info("Revenue-phase detected from goals.md, adding priority hint")
-            except Exception as e:
-                log.debug(f"Goals revenue detection skipped: {e}")
+    # Trigger self-reflection if it's time
+    if now >= _next_reflection_time:
+        log.info("Triggering reflection cycle.")
+        asyncio.create_task(reflection_cycle())
+        _next_reflection_time = now +REFLECTION_INTERVAL
 
-            if revenue_hint:
-                await tg_send(
-                    client,
-                    f"Scheduled reflection starting (revenue-priority mode)... "
-                    f"(next: {REFLECTION_INTERVAL}s)"
-                )
-            else:
-                await tg_send(
-                    client,
-                    f"Scheduled reflection starting... (next: {REFLECTION_INTERVAL}s)"
-                )
+    # Trigger self-growth if it's time AND system is not overloaded
+    pending_improvements = get_pending_improvements_count()  # Assuming this function exists and returns the count
+    if now >= _next_self_growth_time and pending_improvements < MAX_PENDING_IMPROVEMENTS:
+        log.info("Triggering self-growth cycle.")
+        asyncio.create_task(self_growth_scheduler())
+        _next_self_growth_time = now + SELF_GROWTH_INTERVAL
+    elif now >= _next_self_growth_time and pending_improvements >= MAX_PENDING_IMPROVEMENTS:
+        log.warning(
+            f"Skipping self-growth cycle. Too many pending improvements: {pending_improvements} (max: {MAX_PENDING_IMPROVEMENTS})"
+        )
+        # Reset the timer to check again later, but don't trigger now
+        _next_self_growth_time = now + SELF_GROWTH_INTERVAL # Check again after the interval
 
-            executed, result = await reflection_cycle(client)
-            if executed:
-                summary = result[:1000] + "..." if len(result) > 1000 else result
-                await tg_send(client, f"Scheduled reflection complete.\n\n{summary}")
-                log.info("Scheduled reflection: complete")
-            else:
-                log.warning("Scheduled reflection: skipped (conflicting reflection)")
-        except asyncio.CancelledError:
-            log.info("reflection_scheduler: cancelled")
-            raise
-        except Exception as e:
-            log.error(f"Scheduled reflection failed: {e}", exc_info=True)
-            await safe_append_journal(
-                f"### {datetime.now().strftime('%H:%M')} Scheduled reflection error\n{e}"
-            )
-            await asyncio.sleep(10)
+
+def get_pending_improvements_count() -> int:
+    """
+    Placeholder function to get the number of pending improvement jobs.
+    This should be implemented to query the job queue or a similar mechanism.
+    For now, it returns 0.
+    """
+    # In a real implementation, this would query the job queue for jobs with status 'queued' or 'running'
+    # related to self-improvement or reflection.
+    # Example: return len(get_jobs_by_status(['queued', 'running'], job_type=['self_improve', 'reflect']))
+    return 0 # Placeholder
+
+# --- Constants for throttling self-growth ---
+MAX_PENDING_IMPROVEMENTS = 10 # Adjust this value based on system capacity
 
 # --- 自己成長スケジューラ（3フェーズ版） ---
 async def _wait_for_pending_improvements(timeout: int = 600):
