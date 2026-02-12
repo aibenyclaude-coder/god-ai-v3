@@ -136,7 +136,7 @@ def save_state(state: dict):
     except Exception as e:
         log.error(f"Failed to save state to {STATE_PATH}: {e}")
 
-async def safe_save_state(state: dict, state_path: Path = STATE_PATH, memory_dir: Path | None = MEMORY_DIR):
+async def safe_save_state(state: dict):
     """
     Safely saves the AI's state to the specified state file path,
     using a lock to prevent concurrent writes.
@@ -175,9 +175,9 @@ async def safe_save_state(state: dict, state_path: Path = STATE_PATH, memory_dir
                 state_str = state_str.replace(char, replacement)
 
             # Write the cleaned string to the state file
-            state_path.write_text(state_str, encoding="utf-8")
+            STATE_PATH.write_text(state_str, encoding="utf-8")
         except Exception as e:
-            log.error(f"Failed to save state to {state_path}: {e}")
+            log.error(f"Failed to save state to {STATE_PATH}: {e}")
 
 async def safe_save_state(state: dict):
     async with get_write_lock():
