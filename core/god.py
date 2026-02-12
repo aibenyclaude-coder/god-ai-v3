@@ -324,6 +324,27 @@ def format_status(state: dict) -> str:
 
 # --- メインループ ---
 async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
+    # Ensure no stale processes are lingering before starting the polling loop
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            current_pid = os.getpid()
+            if old_pid != current_pid:
+                try:
+                    os.kill(old_pid, 0)
+                    log.warning(f"Stale process detected (PID={old_pid}) at polling_loop start. Terminating...")
+                    os.kill(old_pid, signal.SIGTERM)
+                    await asyncio.sleep(3)
+                    try:
+                        os.kill(old_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    log.info(f"Stale process (PID={old_pid}) terminated before polling")
+                except ProcessLookupError:
+                    log.info(f"Stale PID={old_pid} already gone, no action needed")
+        except (ValueError, Exception) as e:
+            log.error(f"Error checking for stale processes: {e}")
+
     state, conversations = load_state(), load_conversations()
     retry_delay = 5  # Initial retry delay in seconds
     max_retry_delay = 60  # Maximum retry delay
@@ -363,7 +384,7 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                         continue
                     text = msg["text"]
                     log.info(f"Beny: {text[:100]}")
-                    # P1割り込みシグナル発行（自己改善を中断させる）
+                    # P1 interrupt signal (interrupts self-improvement)
                     signal_p1_interrupt()
                     conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "beny", "text": text})
 
@@ -377,7 +398,6 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                             if executed:
                                 summary = result[:1000] + "..." if len(result) > 1000 else result
                                 await tg_send(client, f"振り返り完了。\n\n{summary}")
-                                # 振り返り結果をシステムアクションとして記録
                                 record_system_action(conversations, f"振り返り完了: {summary[:200]}")
                                 save_conversations(conversations)
                             else:
@@ -394,30 +414,25 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
 
                         response = await handle_message(client, text)
                     except AIUnavailable as e:
-                        # Gemini 429 + Claude CLIセッション切れ → 特別な通知
                         response = f"⚠️ {e}\n\nBeny、ターミナルで以下を実行:\n`/opt/homebrew/bin/claude setup-token`"
                         log.error(f"AIUnavailable: {e}")
                         record_system_action(conversations, f"AI停止: {e}")
                     except Exception as e:
                         log.error(f"handle_message failed: {e}", exc_info=True)
                         response = f"エラー: {e}"
-                        # エラーをシステムアクションとして記録
                         record_system_action(conversations, f"エラー発生: {e}")
-                        # If an error occurred and we sent a placeholder message, edit it with the error
                         if pending_message_id:
                             await tg_edit(client, pending_message_id, response)
-                        else: # If no placeholder was sent, send error as new message
+                        else:
                             await tg_send(client, response)
-                        continue # Continue to the next update
+                        continue
 
                     if pending_message_id:
                         await tg_edit(client, pending_message_id, response)
 
                     conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "god", "text": response[:500]})
-                    # ツイート投稿成功をシステムアクションとして記録
                     if "ツイート投稿完了" in response:
                         record_system_action(conversations, f"ツイート投稿: {response}")
-                    # 自己改善成功をシステムアクションとして記録
                     if "自己改善成功" in response:
                         record_system_action(conversations, f"自己改善: {response[:200]}")
                     save_conversations(conversations)
@@ -434,7 +449,6 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
             current_delay = min(retry_delay * (2 ** (error_count - 1)), max_retry_delay)
             await asyncio.sleep(current_delay)
         except Exception as e:
-            # Catch any other unexpected exceptions in the polling loop
             log.error(f"Unexpected error during polling loop: {e}", exc_info=True)
             append_journal(f"### {datetime.now().strftime('%H:%M')} ポーリングループエラー\n{e}")
             error_count += 1
