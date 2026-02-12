@@ -325,12 +325,24 @@ def format_status(state: dict) -> str:
 # --- メインループ ---
 async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
     state, conversations = load_state(), load_conversations()
+    retry_delay = 5  # Initial retry delay in seconds
+    max_retry_delay = 60  # Maximum retry delay
+
     while True:
         try:
             resp = await client.post(f"{TG_BASE}/getUpdates", json={"offset": offset, "timeout": 30}, timeout=60)
+            resp.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
             data = resp.json()
+
             if not data.get("ok"):
-                log.error(f"getUpdates failed: {data}"); await asyncio.sleep(5); continue
+                log.error(f"getUpdates failed: {data}")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
+                continue
+
+            # Reset retry delay if successful
+            retry_delay = 5
+
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
                 msg = update.get("message")
@@ -384,10 +396,16 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                 state["conversations_today"] = state.get("conversations_today", 0) + 1
                 state["status"] = "running"
                 save_state(state)
-        except httpx.ReadTimeout:
-            continue
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.HTTPStatusError) as e:
+            log.error(f"Network/HTTP error during polling: {e}")
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
         except Exception as e:
-            log.error(f"Polling error: {e}"); append_journal(f"### {datetime.now().strftime('%H:%M')} ポーリングエラー\n{e}"); await asyncio.sleep(5)
+            log.error(f"Unexpected error during polling: {e}", exc_info=True)
+            append_journal(f"### {datetime.now().strftime('%H:%M')} ポーリングエラー\n{e}")
+            # For unexpected errors, also implement a retry delay to prevent rapid failure
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
 
 # --- シグナルハンドラ ---
 _shutdown_flag = False
