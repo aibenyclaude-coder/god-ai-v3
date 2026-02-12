@@ -94,13 +94,27 @@ def save_state(state: dict):
         # Convert state to JSON string first, ensuring non-ASCII characters are preserved
         state_str = json.dumps(state, ensure_ascii=False, indent=2)
         
-        # Define problematic characters and their replacements
-        # Focusing on '【' and '】' as per recent issues and common problematic characters in JSON.
+        # Define problematic characters and their replacements.
+        # This dictionary can be expanded to cover a wider range of characters if issues arise.
+        # For now, focusing on commonly problematic full-width characters.
         replacements = {
             '【': '[',  # Replace opening full-width bracket with ASCII equivalent
             '】': ']',  # Replace closing full-width bracket with ASCII equivalent
-            # Add other problematic characters and their replacements as needed in the future.
-            # For now, we limit to the identified issue.
+            '！': '!',  # Replace full-width exclamation mark
+            '？': '?',  # Replace full-width question mark
+            '：': ':',  # Replace full-width colon
+            '；': ';',  # Replace full-width semicolon
+            '，': ',',  # Replace full-width comma
+            '．': '.',  # Replace full-width period
+            '（': '(',  # Replace full-width parenthesis open
+            '）': ')',  # Replace full-width parenthesis close
+            '｛': '{',  # Replace full-width brace open
+            '｝': '}',  # Replace full-width brace close
+            '「': '"',  # Replace full-width quote open
+            '」': '"',  # Replace full-width quote close
+            '‘': "'",  # Replace full-width apostrophe open
+            '’': "'",  # Replace full-width apostrophe close
+            '…': '...', # Replace full-width ellipsis
         }
         
         # Apply replacements to the JSON string
