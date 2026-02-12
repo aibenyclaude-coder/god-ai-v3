@@ -129,6 +129,20 @@ async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
     max_retries = 3
     retry_delay = 8
 
+    # Context window management: Limit prompt length to avoid exceeding model limits
+    # and to prioritize recent information. A reasonable limit could be around 16000 tokens
+    # for Gemini 2.5 Flash Lite, leaving room for the model's response.
+    # Adjust this value based on actual model constraints and performance.
+    MAX_PROMPT_TOKENS = 16000
+    # A rough estimate for tokenization, can be refined with a proper tokenizer if needed.
+    APPROX_TOKENS_PER_CHAR = 0.25
+
+    if len(prompt) * APPROX_TOKENS_PER_CHAR > MAX_PROMPT_TOKENS:
+        log.warning(f"Prompt too long ({len(prompt)} chars), truncating for Gemini. Original length: {len(prompt)}")
+        # Simple truncation, prioritizing the end of the prompt.
+        # More sophisticated methods could involve summarization or keyword extraction.
+        prompt = prompt[int(MAX_PROMPT_TOKENS / APPROX_TOKENS_PER_CHAR) - 1000:] # Keep a buffer
+
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient() as client:
