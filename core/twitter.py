@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
-"""Twitter API連携モジュール - tweepy使用"""
+"""Twitter API連携モジュール - tweepy使用
+ツイート投稿、自動ツイート生成、スケジューラーを管理する。
+"""
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import os
+import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+
 from dotenv import load_dotenv
+
+from config import GOALS_PATH, STATE_PATH, log
 
 # .envファイルを読み込み
 load_dotenv(Path(__file__).parent / ".env")
@@ -14,6 +25,9 @@ TWITTER_API_KEY = os.getenv("TWITTER_API_KEY", "")
 TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET", "")
 TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN", "")
 TWITTER_ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET", "")
+
+TWEET_INTERVAL = 6 * 3600  # 6時間ごと
+MAX_TWEET_HISTORY = 20  # 保存する履歴数
 
 
 def is_configured() -> bool:
@@ -45,6 +59,37 @@ def get_client():
     return client
 
 
+def get_tweet_history() -> list[str]:
+    """state.jsonからtweet_historyのテキスト一覧を取得する。"""
+    try:
+        if not STATE_PATH.exists():
+            return []
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        history = state.get("tweet_history", [])
+        return [h.get("text", "") for h in history if isinstance(h, dict)]
+    except Exception as e:
+        log.warning(f"tweet_history読み込み失敗: {e}")
+        return []
+
+
+def add_to_tweet_history(text: str):
+    """state.jsonのtweet_historyに投稿を追加（最大MAX_TWEET_HISTORY件）。"""
+    try:
+        state = {}
+        if STATE_PATH.exists():
+            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        history = state.get("tweet_history", [])
+        history.append({
+            "text": text,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        # 直近MAX_TWEET_HISTORY件のみ保持
+        state["tweet_history"] = history[-MAX_TWEET_HISTORY:]
+        STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning(f"tweet_history保存失敗: {e}")
+
+
 def post_tweet(text: str, media: list[str] | None = None) -> dict:
     """
     Post a tweet with an appended call-to-action linking to the Coconala service page.
@@ -61,12 +106,6 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
             - url: str (on success)
             - error: str (on failure)
     """
-    import time
-    import logging
-    import re
-
-    log = logging.getLogger("god.twitter")
-
     if not text or not text.strip():
         return {"success": False, "error": "Tweet body is empty"}
 
@@ -80,29 +119,20 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
                      "TWITTER_ACCESS_TOKEN_SECRET"
         }
 
-    # --- Improvement: Check for duplicate tweets ---
-    # Retrieve the history of recently posted tweet texts.
+    # Check for duplicate tweets
     tweet_history = get_tweet_history()
     if text in tweet_history:
         return {"success": False, "error": "Duplicate tweet detected. This tweet has already been posted."}
-    # --- End Improvement ---
 
     # Append call-to-action with Coconala link if not already present and if it seems like a service offering
     coconala_url = "https://coconala.com/services/4072452"
     cta_suffix = f"\n\nLP made by AI: {coconala_url}"
 
-    # Define keywords that suggest a service offering
     service_keywords = ["service", "offer", "consulting", "design", "development", "writing", "translation", "support", "coaching", "tutoring", "freelance"]
-
-    # Check if the text contains any service keywords (case-insensitive)
     is_service_offering = any(re.search(r'\b' + keyword + r'\b', text, re.IGNORECASE) for keyword in service_keywords)
 
-    # Append CTA only if it's a service offering and the URL is not already in the text
     if is_service_offering and coconala_url not in text:
-        # Check if adding CTA exceeds the limit only if no media is present or if it's short
         if len(text) + len(cta_suffix) > 280 and (not media or len(text) <= 280 - len(cta_suffix)):
-            # If text is already long, and we have media, we might not be able to add CTA.
-            # Prioritize posting the content and media.
             pass
         else:
             text = text.rstrip() + cta_suffix
@@ -110,10 +140,8 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
     try:
         client = get_client()
 
-        # Handle media upload if provided
         media_ids = None
         if media:
-            # Ensure media is a list of file paths and each file exists
             valid_media_paths = []
             for media_path in media:
                 if Path(media_path).is_file():
@@ -127,7 +155,6 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
             else:
                 log.warning("No valid media files provided for upload.")
 
-
         # Retry with exponential backoff for transient errors
         max_retries = 3
         last_error = None
@@ -135,9 +162,7 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
             try:
                 response = client.create_tweet(text=text, media_ids=media_ids)
                 tweet_id = response.data["id"]
-                # --- Improvement: Add newly posted tweet to history ---
-                add_to_tweet_history(text) # Assume this function exists to save the new tweet
-                # --- End Improvement ---
+                add_to_tweet_history(text)
                 return {
                     "success": True,
                     "tweet_id": tweet_id,
@@ -146,7 +171,6 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
             except Exception as e:
                 last_error = e
                 error_str = str(e).lower()
-                # Non-transient errors: fail immediately without retry
                 if any(keyword in error_str for keyword in [
                     "unauthorized", "forbidden", "authentication",
                     "invalid", "401", "403", "not found", "404"
@@ -154,7 +178,6 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
                     log.error("Non-transient Twitter API error, not retrying: %s", e)
                     return {"success": False, "error": f"Tweet post error: {e}"}
 
-                # Transient errors (rate limit, server error): retry with backoff
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt
                     log.warning(
@@ -175,27 +198,147 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
         return {"success": False, "error": f"Tweet post error: {e}"}
 
 
-# Placeholder functions for tweet history management.
-# These would need to be implemented based on the actual storage mechanism.
-def get_tweet_history() -> list[str]:
-    """
-    Retrieves the history of posted tweet texts.
-    This is a placeholder and should be replaced with actual data loading logic.
-    """
-    # Example: Load from a file or database
-    # For now, return an empty list.
-    # In a real implementation, this would load from a persistent store.
-    return []
+async def generate_tweet(client) -> str:
+    """Geminiにツイート文を生成させる。goals.mdのX Strategyを読んでトーンや内容を決める。
 
-def add_to_tweet_history(text: str):
+    Args:
+        client: httpx.AsyncClient (未使用だが将来のAPI呼び出し用)
+
+    Returns:
+        生成されたツイートテキスト。失敗時は空文字列。
     """
-    Adds a new tweet text to the history.
-    This is a placeholder and should be replaced with actual data saving logic.
+    from brain import think
+
+    goals_text = ""
+    try:
+        if GOALS_PATH.exists():
+            goals_text = GOALS_PATH.read_text(encoding="utf-8")
+    except Exception as e:
+        log.warning(f"generate_tweet: goals.md読み込み失敗: {e}")
+
+    # 既存ツイート履歴を取得して重複を避ける
+    history = get_tweet_history()
+    history_text = "\n".join(history[-5:]) if history else "(なし)"
+
+    prompt = (
+        "あなたはGod AI（@GODAI_Beny）。以下の戦略に従ってX（Twitter）投稿文を1つ生成しろ。\n\n"
+        f"{goals_text}\n\n"
+        f"【直近の投稿（重複禁止）】\n{history_text}\n\n"
+        "【ルール】\n"
+        "- 140文字以内の日本語ツイート1つだけ出力\n"
+        "- ハッシュタグは1-2個まで\n"
+        "- 実用的で具体的な内容\n"
+        "- 押し売りしない自然なトーン\n"
+        "- AI活用Tips、LP制作の価値、ビジネス効率化のいずれか\n"
+        "- 直近の投稿と似た内容は避ける\n"
+        "- ツイート本文のみ出力。説明や前置き不要\n"
+    )
+
+    try:
+        tweet_text, brain_name = await think(prompt, heavy=False)
+        tweet_text = tweet_text.strip().strip('"').strip("'")
+        if not tweet_text or len(tweet_text) > 280:
+            log.warning(f"generate_tweet: 生成テキスト不正 (len={len(tweet_text) if tweet_text else 0})")
+            return ""
+        return tweet_text
+    except Exception as e:
+        log.error(f"generate_tweet エラー: {e}", exc_info=True)
+        return ""
+
+
+async def auto_tweet(client) -> bool:
+    """ツイートを自動生成→重複チェック→投稿→journal記録。
+
+    Args:
+        client: httpx.AsyncClient (Telegram送信用)
+
+    Returns:
+        投稿成功ならTrue
     """
-    # Example: Save to a file or database
-    # For now, do nothing.
-    # In a real implementation, this would save to a persistent store.
-    pass
+    from god import tg_send
+    from memory import load_conversations, save_conversations, append_journal
+
+    if not is_configured():
+        log.info("auto_tweet: Twitter未設定、スキップ")
+        return False
+
+    tweet_text = await generate_tweet(client)
+    if not tweet_text:
+        return False
+
+    # 重複チェック（generate_tweetで履歴参照済みだが、最終確認）
+    history = get_tweet_history()
+    if tweet_text in history:
+        log.warning("auto_tweet: 生成テキストが履歴と重複、スキップ")
+        return False
+
+    result = post_tweet(tweet_text)
+    if result["success"]:
+        log.info(f"auto_tweet: 投稿成功 {result['url']}")
+        await tg_send(client, f"[自動ツイート投稿]\n{tweet_text}\n{result['url']}")
+        try:
+            conversations = load_conversations()
+            conversations.append({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "from": "system",
+                "text": f"自動ツイート: {tweet_text[:100]}"
+            })
+            save_conversations(conversations)
+        except Exception as e:
+            log.warning(f"auto_tweet: 会話記録失敗: {e}")
+        return True
+    else:
+        log.error(f"auto_tweet: 投稿失敗 {result['error']}")
+        return False
+
+
+async def tweet_scheduler_loop(client):
+    """初回即投稿、その後6時間間隔でauto_tweet()を呼ぶスケジューラー。
+
+    Args:
+        client: httpx.AsyncClient (Telegram送信用)
+    """
+    log.info(f"tweet_scheduler_loop 開始 (間隔: {TWEET_INTERVAL}秒)")
+
+    # 初回即投稿
+    try:
+        await auto_tweet(client)
+    except Exception as e:
+        log.error(f"tweet_scheduler_loop 初回投稿エラー: {e}", exc_info=True)
+
+    # 定期投稿ループ
+    while True:
+        await asyncio.sleep(TWEET_INTERVAL)
+        try:
+            # Generate tweet and check for duplicates before posting
+            tweet_text = await generate_tweet(client)
+            if not tweet_text:
+                log.warning("tweet_scheduler_loop: tweet generation failed, skipping.")
+                continue
+
+            tweet_history = get_tweet_history()
+            if tweet_text in tweet_history:
+                log.warning("tweet_scheduler_loop: Generated tweet is a duplicate, skipping.")
+                continue
+
+            result = post_tweet(tweet_text)
+            if result["success"]:
+                log.info(f"tweet_scheduler_loop: 投稿成功 {result['url']}")
+                await tg_send(client, f"[自動ツイート投稿]\n{tweet_text}\n{result['url']}")
+                try:
+                    conversations = load_conversations()
+                    conversations.append({
+                        "time": datetime.now(timezone.utc).isoformat(),
+                        "from": "system",
+                        "text": f"自動ツイート: {tweet_text[:100]}"
+                    })
+                    save_conversations(conversations)
+                except Exception as e:
+                    log.warning(f"tweet_scheduler_loop: 会話記録失敗: {e}")
+            else:
+                log.error(f"tweet_scheduler_loop: 投稿失敗 {result['error']}")
+        except Exception as e:
+            log.error(f"tweet_scheduler_loop エラー: {e}", exc_info=True)
 
 
 def get_setup_instructions() -> str:
