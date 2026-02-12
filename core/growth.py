@@ -847,7 +847,22 @@ async def run_post_improvement_tests(
 
 # --- コード構文検証関数 ---
 def validate_code_syntax(code: str) -> tuple[bool, str]:
-    """生成コードの構文を厳密に検証。戻り値: (有効かどうか, エラーメッセージ)"""
+    """生成コードの構文を厳密に検証。戻り値: (有効かどうか, エラーメッセージ)
+    Pythonの構文として不正な全角文字（例: 【, 】）の混入も検知する。
+    """
+    # 全角記号（ brackets, quotes etc.）をチェック
+    # This set includes common full-width punctuation and brackets.
+    fullwidth_chars = re.compile(r'[【】『』（）《》「」〔〕、。！？：；]')
+    match = fullwidth_chars.search(code)
+    if match:
+        # Find the line number and context for the invalid character
+        error_line_num = code.count('\n', 0, match.start()) + 1
+        lines = code.splitlines()
+        start = max(0, error_line_num - 3)
+        end = min(len(lines), error_line_num + 2)
+        context = "\n".join([f"{i+1}: {lines[i]}" for i in range(start, end)])
+        return (False, f"Invalid full-width character '{match.group(0)}' found at line {error_line_num}. Check code context:\n{context}")
+
     try:
         ast.parse(code)
         return (True, "")
@@ -858,7 +873,7 @@ def validate_code_syntax(code: str) -> tuple[bool, str]:
             start = max(0, e.lineno - 3)
             end = min(len(lines), e.lineno + 2)
             context = "\n".join([f"{i+1}: {lines[i]}" for i in range(start, end)])
-            error_msg += f"\n周辺コード:\n{context}"
+            error_msg += f"\nCode context:\n{context}"
         return (False, error_msg)
     except Exception as e:
         return (False, f"Unexpected error: {e}")
