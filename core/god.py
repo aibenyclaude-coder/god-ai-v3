@@ -434,8 +434,9 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
             current_delay = min(retry_delay * (2 ** (error_count - 1)), max_retry_delay)
             await asyncio.sleep(current_delay)
         except Exception as e:
-            log.error(f"Unexpected error during polling: {e}", exc_info=True)
-            append_journal(f"### {datetime.now().strftime('%H:%M')} ポーリングエラー\n{e}")
+            # Catch any other unexpected exceptions in the polling loop
+            log.error(f"Unexpected error during polling loop: {e}", exc_info=True)
+            append_journal(f"### {datetime.now().strftime('%H:%M')} ポーリングループエラー\n{e}")
             error_count += 1
             current_delay = min(retry_delay * (2 ** (error_count - 1)), max_retry_delay)
             await asyncio.sleep(current_delay)
