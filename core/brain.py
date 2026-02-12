@@ -366,6 +366,35 @@ async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
         remaining = get_ai_pause_remaining()
         raise AIUnavailable(f"AI is currently paused (remaining {remaining} seconds).")
 
+    # Check if current goal is revenue generation and prepend LP priority instruction
+    try:
+        from config import GOALS_PATH
+        if GOALS_PATH.exists():
+            goals_text = GOALS_PATH.read_text(encoding="utf-8")
+            # Detect revenue-focused phase from goals
+            revenue_keywords = ["LP", "coconala", "revenue", "earning", "income"]
+            is_revenue_phase = any(kw.lower() in goals_text.lower() for kw in revenue_keywords)
+            if is_revenue_phase:
+                state = load_state()
+                current_task = state.get("current_task")
+                # Only prepend LP instruction when no specific task is set
+                # or when the task is related to revenue/content generation
+                revenue_task_keywords = ["lp", "revenue", "coconala", "content", "x post", "landing"]
+                task_is_revenue = (
+                    current_task is None
+                    or (isinstance(current_task, str) and any(k in current_task.lower() for k in revenue_task_keywords))
+                )
+                if task_is_revenue:
+                    lp_instruction = (
+                        "[PRIORITY] Current goal is revenue generation via LP content creation. "
+                        "When generating content, prioritize high-quality LP (landing page) material, "
+                        "persuasive copy, and actionable output suitable for Coconala service delivery.\n\n"
+                    )
+                    prompt = lp_instruction + prompt
+                    log.info("Revenue generation goal detected, prepended LP priority instruction to prompt.")
+    except Exception as e:
+        log.warning(f"Failed to check revenue goal status: {e}")
+
     # Attempt to use AI models, with fallbacks and specific error handling.
     try:
         if heavy:
