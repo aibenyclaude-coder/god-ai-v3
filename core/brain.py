@@ -81,11 +81,24 @@ CLI_ENV = _get_cli_env()
 
 # --- 脳の使い分けカウンタ（state.jsonに永続化） ---
 def _load_brain_counts() -> tuple[int, int, int]:
-    """state.jsonからカウンターを読み込む"""
+    """Load counters from state.json. If the file does not exist or is invalid, return default values."""
     try:
-        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        # Attempt to read and parse the state file.
+        state_text = STATE_PATH.read_text(encoding="utf-8")
+        state = json.loads(state_text)
+        # Return counts, defaulting to 0 if keys are missing.
         return state.get("gemini_count", 0), state.get("glm_count", 0), state.get("claude_count", 0)
-    except (json.JSONDecodeError, FileNotFoundError):
+    except FileNotFoundError:
+        # If the state file doesn't exist, log this as a normal startup condition and return defaults.
+        log.info(f"State file not found at {STATE_PATH}. Initializing counts to zero.")
+        return 0, 0, 0
+    except json.JSONDecodeError:
+        # If the file content is not valid JSON, log an error and return defaults.
+        log.error(f"Error decoding JSON from {STATE_PATH}. File content might be corrupted. Initializing counts to zero.")
+        return 0, 0, 0
+    except Exception as e:
+        # Catch any other unexpected exceptions during file loading.
+        log.error(f"An unexpected error occurred while loading brain counts from {STATE_PATH}: {e}. Initializing counts to zero.")
         return 0, 0, 0
 
 async def _save_brain_counts(gemini: int, glm: int, claude: int):
