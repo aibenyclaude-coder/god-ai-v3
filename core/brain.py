@@ -459,6 +459,11 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
 async def think(prompt: str, heavy: bool = False, bias_to_x_lp: bool = False) -> tuple[str, str]:
     """Unified thinking function. Returns: (text, brain_name)
 
+    When generating tweet content (detected via prompt keywords), applies A/B testing logic:
+    retrieves past tweet engagement data via twitter.get_tweet_history_with_metrics(),
+    augments the prompt with top-performing patterns, and requests multiple variations
+    with tracking metadata so the caller can select and measure the best option.
+
     Args:
         prompt (str): The input prompt for the AI model.
         heavy (bool, optional): If True, prioritizes Claude CLI for longer tasks. Defaults to False.
@@ -475,6 +480,82 @@ async def think(prompt: str, heavy: bool = False, bias_to_x_lp: bool = False) ->
     # Dynamically prepend instructions based on goals or explicit bias.
     augmented_prompt = prompt
     prepended_instruction = False
+
+    # --- A/B testing logic for tweet content generation ---
+    tweet_keywords = [
+        "tweet", "post to x", "x post", "twitter", "auto_tweet",
+        "generate tweet", "write tweet", "compose tweet",
+    ]
+    prompt_lower = prompt.lower()
+    is_tweet_prompt = any(kw in prompt_lower for kw in tweet_keywords)
+
+    if is_tweet_prompt:
+        log.info("Tweet content detected in prompt, applying A/B testing augmentation.")
+        try:
+            from twitter import get_tweet_history_with_metrics
+            metrics_history = get_tweet_history_with_metrics()
+
+            if metrics_history:
+                # Sort by total engagement score (likes * 2 + retweets * 3 + replies)
+                def engagement_score(entry):
+                    likes = entry.get("likes", 0) or 0
+                    retweets = entry.get("retweets", 0) or 0
+                    replies = entry.get("replies", 0) or 0
+                    return likes * 2 + retweets * 3 + replies
+
+                sorted_tweets = sorted(metrics_history, key=engagement_score, reverse=True)
+                # Take top 5 performing tweets for pattern analysis
+                top_tweets = sorted_tweets[:5]
+
+                # Build engagement summary for the prompt
+                engagement_lines = []
+                for i, tw in enumerate(top_tweets, 1):
+                    text_preview = (tw.get("text", "")[:80] + "...") if len(tw.get("text", "")) > 80 else tw.get("text", "")
+                    score = engagement_score(tw)
+                    engagement_lines.append(
+                        f"  {i}. [score={score}, likes={tw.get('likes', 0)}, "
+                        f"retweets={tw.get('retweets', 0)}, replies={tw.get('replies', 0)}] "
+                        f"\"{text_preview}\""
+                    )
+
+                total_tweets = len(metrics_history)
+                avg_score = sum(engagement_score(t) for t in metrics_history) / total_tweets if total_tweets > 0 else 0
+
+                ab_test_instruction = (
+                    "[A/B TESTING MODE] Generate exactly 3 tweet variations for comparison.\n"
+                    f"Past tweet performance data ({total_tweets} tweets analyzed, avg engagement score: {avg_score:.1f}):\n"
+                    "Top performing tweets:\n"
+                    + "\n".join(engagement_lines) + "\n\n"
+                    "Instructions:\n"
+                    "- Analyze the patterns in top-performing tweets (tone, length, hashtags, emoji usage, CTA style)\n"
+                    "- Generate 3 distinct variations, each exploring a different style:\n"
+                    "  Variation A: Mirror the style of the highest-performing tweet\n"
+                    "  Variation B: Try a contrasting approach (different tone/structure)\n"
+                    "  Variation C: Blend elements from multiple top tweets\n"
+                    "- Format output as JSON: {\"variations\": [{\"id\": \"A\", \"text\": \"...\", \"style\": \"...\"}, ...]}\n"
+                    "- Each tweet must be under 280 characters\n"
+                    "- Include a \"style\" field describing the approach used\n\n"
+                )
+                augmented_prompt = ab_test_instruction + augmented_prompt
+                log.info(f"A/B testing: augmented prompt with {len(top_tweets)} top tweet patterns (avg score: {avg_score:.1f})")
+            else:
+                # No history available, still request variations but without performance data
+                ab_test_no_data = (
+                    "[A/B TESTING MODE] No past engagement data available yet.\n"
+                    "Generate exactly 3 tweet variations for comparison to establish a baseline:\n"
+                    "  Variation A: Professional/informative tone\n"
+                    "  Variation B: Casual/conversational tone\n"
+                    "  Variation C: Bold/attention-grabbing tone\n"
+                    "- Format output as JSON: {\"variations\": [{\"id\": \"A\", \"text\": \"...\", \"style\": \"...\"}, ...]}\n"
+                    "- Each tweet must be under 280 characters\n"
+                    "- Include a \"style\" field describing the approach used\n\n"
+                )
+                augmented_prompt = ab_test_no_data + augmented_prompt
+                log.info("A/B testing: no engagement history, requesting baseline variations.")
+        except ImportError:
+            log.warning("twitter module not available, skipping A/B testing augmentation.")
+        except Exception as e:
+            log.warning(f"Failed to apply A/B testing augmentation: {e}")
 
     # 1. Check if bias_to_x_lp is explicitly True.
     if bias_to_x_lp:
