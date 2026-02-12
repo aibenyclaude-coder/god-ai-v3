@@ -41,9 +41,32 @@ def read_file(path: Path, tail: int = 0) -> str:
 
 # --- State管理 ---
 def load_state() -> dict:
+    """
+    Loads the AI's state from the state file.
+    If the file is not found or corrupted, returns a default state.
+    """
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, FileNotFoundError):
+        state_content = STATE_PATH.read_text(encoding="utf-8")
+        return json.loads(state_content)
+    except FileNotFoundError:
+        log.warning(f"State file not found at {STATE_PATH}. Returning default state.")
+        return {"status": "unknown", "current_task": None, "last_reflection": None,
+                "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
+    except json.JSONDecodeError:
+        log.error(f"State file at {STATE_PATH} is corrupted. Attempting recovery.")
+        # Attempt to recover by creating a default state and logging the error
+        try:
+            # Create a backup of the corrupted file
+            backup_path = MEMORY_DIR / f"state.json.corrupted.{datetime.now(timezone.utc).isoformat().replace(':', '-')}"
+            backup_path.write_text(state_content, encoding="utf-8")
+            log.info(f"Corrupted state file backed up to {backup_path}")
+        except Exception as e:
+            log.error(f"Failed to create backup of corrupted state file: {e}")
+
+        return {"status": "unknown", "current_task": None, "last_reflection": None,
+                "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
+    except Exception as e:
+        log.error(f"An unexpected error occurred while loading state from {STATE_PATH}: {e}")
         return {"status": "unknown", "current_task": None, "last_reflection": None,
                 "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
 
