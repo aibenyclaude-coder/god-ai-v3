@@ -50,6 +50,15 @@ def load_state() -> dict:
         return json.loads(state_content)
     except FileNotFoundError:
         log.warning(f"State file not found at {STATE_PATH}. Returning default state.")
+        # Check if MEMORY_DIR is defined before attempting to create a backup path
+        if 'MEMORY_DIR' in globals() and MEMORY_DIR is not None:
+            backup_path = MEMORY_DIR / "state.json.bak"
+            if backup_path.exists():
+                log.info(f"Restoring state from backup: {backup_path}")
+                try:
+                    return json.loads(backup_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, FileNotFoundError) as e:
+                    log.error(f"Failed to restore state from backup {backup_path}: {e}")
         return {"status": "unknown", "current_task": None, "last_reflection": None,
                 "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
     except json.JSONDecodeError:
@@ -58,10 +67,14 @@ def load_state() -> dict:
         try:
             # Create a backup of the corrupted file with a timestamp
             corrupted_state_content = STATE_PATH.read_text(encoding="utf-8")
-            backup_filename = f"state.json.corrupted.{datetime.now(timezone.utc).isoformat().replace(':', '-')}.bak"
-            backup_path = MEMORY_DIR / backup_filename
-            backup_path.write_text(corrupted_state_content, encoding="utf-8")
-            log.info(f"Corrupted state file backed up to {backup_path}")
+            # Ensure MEMORY_DIR is defined before creating backup path
+            if 'MEMORY_DIR' in globals() and MEMORY_DIR is not None:
+                backup_filename = f"state.json.corrupted.{datetime.now(timezone.utc).isoformat().replace(':', '-')}.bak"
+                backup_path = MEMORY_DIR / backup_filename
+                backup_path.write_text(corrupted_state_content, encoding="utf-8")
+                log.info(f"Corrupted state file backed up to {backup_path}")
+            else:
+                log.warning("MEMORY_DIR not defined. Cannot back up corrupted state file.")
         except Exception as e:
             log.error(f"Failed to create backup of corrupted state file: {e}")
 
