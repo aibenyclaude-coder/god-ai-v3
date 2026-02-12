@@ -91,18 +91,31 @@ def save_state(state: dict):
     Validates for full-width characters that could break JSON/Python syntax.
     """
     try:
-        # Check for invalid full-width characters that could break JSON/Python syntax
-        # Specifically looking for characters like '【' and '】' which caused issues.
+        # Replace potentially problematic full-width characters with ASCII equivalents or remove them.
+        # Specifically targeting '【' and '】' which have caused issues in JSON serialization.
         state_str = json.dumps(state, ensure_ascii=False, indent=2)
-        if '【' in state_str or '】' in state_str:
-            log.error("Found invalid full-width characters in state data. Skipping save.")
-            # Optionally, try to sanitize the data here or log more details
-            # For now, we skip saving to prevent corruption.
-            return
+        
+        # Define problematic characters and their replacements
+        replacements = {
+            '【': '[',  # Replace opening full-width bracket with ASCII equivalent
+            '】': ']',  # Replace closing full-width bracket with ASCII equivalent
+            # Add other problematic characters and their replacements as needed
+        }
+        
+        for char, replacement in replacements.items():
+            state_str = state_str.replace(char, replacement)
 
         STATE_PATH.write_text(state_str, encoding="utf-8")
     except Exception as e:
         log.error(f"Failed to save state to {STATE_PATH}: {e}")
+
+async def safe_save_state(state: dict):
+    async with get_write_lock():
+        save_state(state)
+
+async def safe_save_state(state: dict):
+    async with get_write_lock():
+        save_state(state)
 
 async def safe_save_state(state: dict):
     async with get_write_lock():
