@@ -364,54 +364,71 @@ async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
         remaining = get_ai_pause_remaining()
         raise AIUnavailable(f"AI is currently paused (remaining {remaining} seconds).")
 
-    # Add a try-except block to gracefully handle exceptions during the execution of underlying AI calls
+    # Attempt to use AI models, with fallbacks and specific error handling.
     try:
         if heavy:
+            # For heavy tasks, prioritize Claude CLI, then Gemini.
             try:
-                # Attempt to use Claude CLI for heavy tasks first
                 return await think_claude(prompt)
             except ClaudeSessionExpired:
                 log.warning("Claude CLI session expired, falling back to Gemini.")
-                # If Claude session expired, try Gemini
                 return await think_gemini(prompt)
             except Exception as e:
-                # Catch any other exceptions from think_claude and fallback to Gemini
+                # Catch any other exceptions from think_claude and fallback to Gemini.
                 log.error(f"Error in think_claude during heavy task: {e}. Falling back to Gemini.", exc_info=True)
                 return await think_gemini(prompt)
         else:
-            # Primary path for non-heavy tasks: try Gemini first
-            return await think_gemini(prompt)
+            # For non-heavy tasks, prioritize Gemini, then GLM-4.
+            try:
+                return await think_gemini(prompt)
+            except Exception as e:
+                # If Gemini fails, try GLM-4.
+                log.error(f"Gemini failed for non-heavy task: {e}. Falling back to GLM-4.", exc_info=True)
+                try:
+                    text, brain = await think_glm(prompt)
+                    return (text, f"{brain} (fallback)")
+                except Exception as glm_error:
+                    # If GLM-4 also fails, try Claude CLI.
+                    log.error(f"GLM-4 also failed: {glm_error}. Falling back to Claude CLI.", exc_info=True)
+                    try:
+                        text, brain = await think_claude(prompt)
+                        return (text, f"{brain} (fallback)")
+                    except ClaudeSessionExpired:
+                        log.error("Claude CLI session expired during fallback.")
+                        raise AIUnavailable("AI is unavailable. All models failed, Claude CLI session expired.") from glm_error
+                    except Exception as claude_error:
+                        log.error(f"Claude CLI failed during fallback: {claude_error}", exc_info=True)
+                        raise AIUnavailable(f"AI is unavailable. All models failed, including Claude CLI fallback.") from claude_error
+
     except AIUnavailable as e:
-        # Re-raise AIUnavailable if it's already an AIUnavailable from think_gemini or other AI issues
+        # Re-raise AIUnavailable exceptions that originate from the underlying AI functions.
         log.error(f"AI Unavailable: {e}")
         raise e
     except Exception as e:
-        # Catch any other unexpected exceptions during the AI thinking process and attempt fallbacks
+        # Catch any other unexpected exceptions during the AI thinking process and attempt fallbacks.
         log.error(f"An unexpected error occurred during AI thinking: {e}", exc_info=True)
-        # Attempt to fall back to another AI if the primary failed
+        # If a general unexpected error occurred, try to use the most robust fallback (Claude CLI, then Gemini).
         try:
-            if heavy:
-                # If the heavy task failed and it wasn't a ClaudeSessionExpired,
-                # Gemini is the next logical fallback.
-                log.warning("Heavy task failed, attempting fallback to Gemini.")
-                return await think_gemini(prompt)
-            else:
-                # For non-heavy tasks, if Gemini failed, try GLM-4.
-                log.warning("Non-heavy task failed, attempting fallback to GLM-4.")
-                text, brain = await think_glm(prompt)
-                return (text, f"{brain} (fallback)")
+            log.warning("Attempting fallback to Claude CLI due to unexpected error.")
+            return await think_claude(prompt)
         except ClaudeSessionExpired:
-            # This specific exception handler is for the fallback attempt.
-            # If the fallback to Claude CLI fails due to session expired during a general fallback attempt.
-            log.error("Fallback to Claude CLI failed due to session expired.")
-            # If even the fallback AI models fail (e.g., Claude session expired during fallback),
-            # it indicates a more severe issue.
-            raise AIUnavailable("AI is unavailable. All attempts to use AI models have failed, including fallbacks.") from e
-        except Exception as fallback_e:
-            # Catch any exceptions during the fallback AI attempts
-            log.error(f"Fallback AI attempt also failed: {fallback_e}", exc_info=True)
-            # If all fallbacks fail, raise a comprehensive AIUnavailable exception detailing the original and fallback errors.
-            raise AIUnavailable(f"AI is unavailable. Primary and fallback AI models failed: {e} and {fallback_e}") from e
+            log.warning("Claude CLI session expired during general fallback, attempting Gemini.")
+            try:
+                return await think_gemini(prompt)
+            except Exception as gemini_fallback_e:
+                log.error(f"Gemini fallback also failed: {gemini_fallback_e}", exc_info=True)
+                raise AIUnavailable(f"AI is unavailable. Unexpected error occurred and all fallback models failed: {e}") from gemini_fallback_e
+        except Exception as claude_fallback_e:
+            log.error(f"Claude CLI fallback also failed: {claude_fallback_e}", exc_info=True)
+            raise AIUnavailable(f"AI is unavailable. Unexpected error occurred and Claude CLI fallback failed: {e}") from claude_fallback_e
+
+def is_heavy(message: str) -> bool:
+    from config import HEAVY_KEYWORDS
+    return any(kw in message for kw in HEAVY_KEYWORDS)
+
+def get_brain_counts() -> tuple[int, int, int]:
+    """(gemini_count, glm_count, claude_count) を返す（state.jsonから永続化された値）"""
+    return _gemini_count, _glm_count, _claude_count
 
 def is_heavy(message: str) -> bool:
     from config import HEAVY_KEYWORDS
