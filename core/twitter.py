@@ -362,9 +362,37 @@ async def tweet_scheduler_loop(client):
 
     # Attempt an immediate tweet post if there are no tweets in the history upon startup.
     # This ensures a tweet is posted if the system starts and the queue is empty.
+    # Also, checks for duplicate tweets before attempting to post.
     if not get_tweet_history():
         log.info("tweet_scheduler_loop: No existing tweet history, attempting immediate tweet.")
-        await auto_tweet(client)
+        # Generate tweet first to check for duplicates against potentially empty history
+        tweet_text_to_post = await generate_tweet(client)
+        if tweet_text_to_post and tweet_text_to_post.strip():
+            if tweet_text_to_post not in get_tweet_history(): # Double-check for duplicates
+                result = post_tweet(tweet_text_to_post)
+                if result["success"]:
+                    log.info(f"tweet_scheduler_loop: Initial tweet posted successfully {result['url']}")
+                    try:
+                        # Assuming tg_send is available and works like documented in god.py
+                        # Need to import tg_send or ensure it's accessible.
+                        # from god import tg_send # This import might be needed if not globally available.
+                        # For now, assuming it's accessible in the context of god.py's event loop.
+                        await tg_send(client, f"[Auto-tweet Posted]\n{tweet_text_to_post}\n{result['url']}")
+                        conversations = load_conversations()
+                        conversations.append({
+                            "time": datetime.now(timezone.utc).isoformat(),
+                            "from": "system",
+                            "text": f"Auto-tweet: {tweet_text_to_post[:100]}"
+                        })
+                        save_conversations(conversations)
+                    except Exception as e:
+                        log.warning(f"tweet_scheduler_loop: Failed to send Telegram message or save conversation history: {e}")
+                else:
+                    log.error(f"tweet_scheduler_loop: Initial tweet posting failed {result['error']}")
+            else:
+                log.warning("tweet_scheduler_loop: Generated initial tweet is a duplicate, skipping.")
+        else:
+            log.warning("tweet_scheduler_loop: Failed to generate initial tweet, skipping.")
     else:
         log.info("tweet_scheduler_loop: Existing tweet history found, proceeding with normal schedule.")
 
