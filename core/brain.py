@@ -368,15 +368,18 @@ async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
     try:
         if heavy:
             try:
+                # Attempt to use Claude CLI for heavy tasks first
                 return await think_claude(prompt)
             except ClaudeSessionExpired:
                 log.warning("Claude CLI session expired, falling back to Gemini.")
+                # If Claude session expired, try Gemini
                 return await think_gemini(prompt)
             except Exception as e:
+                # Catch any other exceptions from think_claude and fallback to Gemini
                 log.error(f"Error in think_claude during heavy task: {e}. Falling back to Gemini.", exc_info=True)
                 return await think_gemini(prompt)
         else:
-            # Primary path for non-heavy tasks
+            # Primary path for non-heavy tasks: try Gemini first
             return await think_gemini(prompt)
     except AIUnavailable as e:
         # Re-raise AIUnavailable if it's already an AIUnavailable from think_gemini or other AI issues
@@ -388,20 +391,24 @@ async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
         # Attempt to fall back to another AI if the primary failed
         try:
             if heavy:
+                # If the heavy task failed and it wasn't a ClaudeSessionExpired,
+                # Gemini is the next logical fallback.
                 log.warning("Heavy task failed, attempting fallback to Gemini.")
-                # If Claude failed and it was a heavy task, Gemini is the next logical fallback.
                 return await think_gemini(prompt)
             else:
+                # For non-heavy tasks, if Gemini failed, try GLM-4.
                 log.warning("Non-heavy task failed, attempting fallback to GLM-4.")
-                # For non-heavy tasks, Gemini might have failed; try GLM-4.
                 text, brain = await think_glm(prompt)
                 return (text, f"{brain} (fallback)")
         except ClaudeSessionExpired:
+            # This specific exception handler is for the fallback attempt.
+            # If the fallback to Claude CLI fails due to session expired during a general fallback attempt.
             log.error("Fallback to Claude CLI failed due to session expired.")
             # If even the fallback AI models fail (e.g., Claude session expired during fallback),
             # it indicates a more severe issue.
             raise AIUnavailable("AI is unavailable. All attempts to use AI models have failed, including fallbacks.") from e
         except Exception as fallback_e:
+            # Catch any exceptions during the fallback AI attempts
             log.error(f"Fallback AI attempt also failed: {fallback_e}", exc_info=True)
             # If all fallbacks fail, raise a comprehensive AIUnavailable exception detailing the original and fallback errors.
             raise AIUnavailable(f"AI is unavailable. Primary and fallback AI models failed: {e} and {fallback_e}") from e
