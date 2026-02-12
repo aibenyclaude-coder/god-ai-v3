@@ -320,6 +320,7 @@ def update_job(task_id: str, **updates) -> dict | None:
     使用例:
         update_job("improve-abc123", status="running")
         update_job("improve-abc123", status="success", output={...})
+        update_job("improve-abc123", error="Something went wrong")
     """
     jobs = load_queue()
     for job in jobs:
@@ -337,10 +338,16 @@ def update_job(task_id: str, **updates) -> dict | None:
                 elif key == "worker_id":
                     job["worker_id"] = value
                 elif key == "error":
-                    job["meta"]["error_history"].append({
+                    # Capture exception information for errors
+                    error_info = {
                         "time": datetime.now(timezone.utc).isoformat(),
                         "error": str(value),
-                    })
+                    }
+                    # If the error is an exception object, try to get traceback
+                    if hasattr(value, "__traceback__") and value.__traceback__:
+                        import traceback
+                        error_info["traceback"] = traceback.format_tb(value.__traceback__)
+                    job["meta"]["error_history"].append(error_info)
                     job["meta"]["retry_count"] = job["meta"].get("retry_count", 0) + 1
                 elif key == "backup_path":
                     job["meta"]["backup_path"] = value
