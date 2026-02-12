@@ -327,6 +327,7 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
     state, conversations = load_state(), load_conversations()
     retry_delay = 5  # Initial retry delay in seconds
     max_retry_delay = 60  # Maximum retry delay
+    error_count = 0 # Counter for consecutive errors
 
     while True:
         try:
@@ -343,11 +344,13 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
 
             if not data.get("ok"):
                 log.error(f"getUpdates failed: {data}")
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, max_retry_delay)
+                error_count += 1
+                current_delay = min(retry_delay * (2 ** (error_count - 1)), max_retry_delay)
+                await asyncio.sleep(current_delay)
                 continue
 
-            # Reset retry delay if successful
+            # Reset error count and retry delay if successful
+            error_count = 0
             retry_delay = 5
 
             for update in data.get("result", []):
@@ -395,7 +398,8 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                     log.error(f"AIUnavailable: {e}")
                     record_system_action(conversations, f"AI停止: {e}")
                 except Exception as e:
-                    response = f"エラー: {e}"; log.error(f"handle_message failed: {e}", exc_info=True)
+                    log.error(f"handle_message failed: {e}", exc_info=True)
+                    response = f"エラー: {e}"
                     # エラーをシステムアクションとして記録
                     record_system_action(conversations, f"エラー発生: {e}")
                     # If an error occurred and we sent a placeholder message, edit it with the error
@@ -421,14 +425,15 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                 save_state(state)
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.HTTPStatusError) as e:
             log.error(f"Network/HTTP error during polling: {e}")
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, max_retry_delay)
+            error_count += 1
+            current_delay = min(retry_delay * (2 ** (error_count - 1)), max_retry_delay)
+            await asyncio.sleep(current_delay)
         except Exception as e:
             log.error(f"Unexpected error during polling: {e}", exc_info=True)
             append_journal(f"### {datetime.now().strftime('%H:%M')} ポーリングエラー\n{e}")
-            # For unexpected errors, also implement a retry delay to prevent rapid failure
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, max_retry_delay)
+            error_count += 1
+            current_delay = min(retry_delay * (2 ** (error_count - 1)), max_retry_delay)
+            await asyncio.sleep(current_delay)
 
 # --- シグナルハンドラ ---
 _shutdown_flag = False
