@@ -44,56 +44,87 @@ def load_state() -> dict:
     """
     Loads the AI's state from the state file.
     If the file is not found or corrupted, returns a default state.
-    Attempts to restore from backup if available.
+    Implements a retry mechanism for file operations.
     """
     state_path = STATE_PATH
     memory_dir = MEMORY_DIR
+    max_retries = 3
+    retry_delay = 1  # seconds
 
-    if not state_path.exists():
-        log.warning(f"State file not found at {state_path}. Attempting to restore from backup.")
-        # Check if MEMORY_DIR is defined before attempting to create a backup path
-        if memory_dir is not None:
-            backup_path = memory_dir / "state.json.bak"
-            if backup_path.exists():
-                log.info(f"Restoring state from backup: {backup_path}")
-                try:
-                    return json.loads(backup_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, FileNotFoundError) as e:
-                    log.error(f"Failed to restore state from backup {backup_path}: {e}")
-        
-        # If no backup or backup failed, return default state
-        log.info("Returning default state.")
-        return {"status": "unknown", "current_task": None, "last_reflection": None,
-                "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
-    
-    try:
-        state_content = state_path.read_text(encoding="utf-8")
-        return json.loads(state_content)
-    except json.JSONDecodeError:
-        log.error(f"State file at {state_path} is corrupted. Attempting recovery.")
-        # Attempt to recover by creating a backup and returning a default state
+    for attempt in range(max_retries):
         try:
-            # Create a backup of the corrupted file with a timestamp
-            corrupted_state_content = state_path.read_text(encoding="utf-8")
-            if memory_dir is not None:
-                # Construct backup filename safely
-                timestamp = datetime.now(timezone.utc).isoformat().replace(':', '-').replace('+', '_')
-                backup_filename = f"state.json.corrupted.{timestamp}.bak"
-                backup_path = memory_dir / backup_filename
-                backup_path.write_text(corrupted_state_content, encoding="utf-8")
-                log.info(f"Corrupted state file backed up to {backup_path}")
-            else:
-                log.warning("MEMORY_DIR not defined. Cannot back up corrupted state file.")
-        except Exception as e:
-            log.error(f"Failed to create backup of corrupted state file: {e}")
+            if not state_path.exists():
+                log.warning(f"State file not found at {state_path}. Attempting to restore from backup.")
+                if memory_dir is not None:
+                    backup_path = memory_dir / "state.json.bak"
+                    if backup_path.exists():
+                        log.info(f"Restoring state from backup: {backup_path}")
+                        try:
+                            return json.loads(backup_path.read_text(encoding="utf-8"))
+                        except (json.JSONDecodeError, FileNotFoundError) as e:
+                            log.error(f"Failed to restore state from backup {backup_path}: {e}")
+                
+                log.info("Returning default state.")
+                return {"status": "unknown", "current_task": None, "last_reflection": None,
+                        "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
+            
+            state_content = state_path.read_text(encoding="utf-8")
+            return json.loads(state_content)
+        
+        except json.JSONDecodeError:
+            log.error(f"State file at {state_path} is corrupted on attempt {attempt + 1}/{max_retries}. Attempting recovery.")
+            if attempt < max_retries - 1:
+                log.info(f"Retrying in {retry_delay} seconds...")
+                asyncio.sleep(retry_delay)  # Use asyncio.sleep if in an async context, otherwise time.sleep
+                retry_delay *= 2  # Exponential backoff
+                continue
 
-        log.info("Returning default state after corruption.")
-        return {"status": "unknown", "current_task": None, "last_reflection": None,
-                "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
-    except Exception as e:
-        log.error(f"An unexpected error occurred while loading state from {state_path}: {e}")
-        return {"status": "unknown", "current_task": None, "last_reflection": None,
-                "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
+            # Recovery attempt after all retries fail
+            try:
+                corrupted_state_content = state_path.read_text(encoding="utf-8")
+                if memory_dir is not None:
+                    timestamp = datetime.now(timezone.utc).isoformat().replace(':', '-').replace('+', '_')
+                    backup_filename = f"state.json.corrupted.{timestamp}.bak"
+                    backup_path = memory_dir / backup_filename
+                    backup_path.write_text(corrupted_state_content, encoding="utf-8")
+                    log.info(f"Corrupted state file backed up to {backup_path}")
+                else:
+                    log.warning("MEMORY_DIR not defined. Cannot back up corrupted state file.")
+            except Exception as e:
+                log.error(f"Failed to create backup of corrupted state file: {e}")
+
+            log.info("Returning default state after corruption.")
+            return {"status": "unknown", "current_task": None, "last_reflection": None,
+                    "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
+        
+        except FileNotFoundError:
+            log.error(f"State file not found at {state_path} on attempt {attempt + 1}/{max_retries}.")
+            if attempt < max_retries - 1:
+                log.info(f"Retrying in {retry_delay} seconds...")
+                asyncio.sleep(retry_delay) # Use asyncio.sleep if in an async context, otherwise time.sleep
+                retry_delay *= 2
+                continue
+            else:
+                log.info("Returning default state after file not found.")
+                return {"status": "unknown", "current_task": None, "last_reflection": None,
+                        "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
+
+        except Exception as e:
+            log.error(f"An unexpected error occurred while loading state from {state_path} on attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                log.info(f"Retrying in {retry_delay} seconds...")
+                asyncio.sleep(retry_delay) # Use asyncio.sleep if in an async context, otherwise time.sleep
+                retry_delay *= 2
+                continue
+            else:
+                log.error("Returning default state due to unexpected error.")
+                return {"status": "unknown", "current_task": None, "last_reflection": None,
+                        "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
+    
+    # Fallback in case loop finishes without returning (should not happen with `continue` and `return`)
+    log.error("Fallback: load_state exited loop without returning a value. Returning default state.")
+    return {"status": "unknown", "current_task": None, "last_reflection": None,
+            "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
 
 def save_state(state: dict):
     """
