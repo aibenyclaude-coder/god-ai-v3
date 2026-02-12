@@ -63,6 +63,7 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
     """
     import time
     import logging
+    import re  # Import the regular expression module
 
     log = logging.getLogger("god.twitter")
 
@@ -79,17 +80,25 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
                      "TWITTER_ACCESS_TOKEN_SECRET"
         }
 
-    # Append call-to-action with Coconala link if not already present
+    # Append call-to-action with Coconala link if not already present and if it seems like a service offering
     coconala_url = "https://coconala.com/services/4072452"
     cta_suffix = f"\n\nLP made by AI: {coconala_url}"
 
-    # Check if adding CTA exceeds the limit only if no media is present or if it's short
-    if len(text) + len(cta_suffix) > 280 and (not media or len(text) <= 280 - len(cta_suffix)):
-        # If text is already long, and we have media, we might not be able to add CTA.
-        # Prioritize posting the content and media.
-        pass
-    elif coconala_url not in text:
-        text = text.rstrip() + cta_suffix
+    # Define keywords that suggest a service offering
+    service_keywords = ["service", "offer", "consulting", "design", "development", "writing", "translation", "support", "coaching", "tutoring", "freelance"]
+
+    # Check if the text contains any service keywords (case-insensitive)
+    is_service_offering = any(re.search(r'\b' + keyword + r'\b', text, re.IGNORECASE) for keyword in service_keywords)
+
+    # Append CTA only if it's a service offering and the URL is not already in the text
+    if is_service_offering and coconala_url not in text:
+        # Check if adding CTA exceeds the limit only if no media is present or if it's short
+        if len(text) + len(cta_suffix) > 280 and (not media or len(text) <= 280 - len(cta_suffix)):
+            # If text is already long, and we have media, we might not be able to add CTA.
+            # Prioritize posting the content and media.
+            pass
+        else:
+            text = text.rstrip() + cta_suffix
 
     try:
         client = get_client()
@@ -97,8 +106,20 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
         # Handle media upload if provided
         media_ids = None
         if media:
-            media_upload_response = client.upload_media(media, media_category="tweet_image")
-            media_ids = media_upload_response.data["media_id"]
+            # Ensure media is a list of file paths and each file exists
+            valid_media_paths = []
+            for media_path in media:
+                if Path(media_path).is_file():
+                    valid_media_paths.append(media_path)
+                else:
+                    log.warning("Media file not found, skipping: %s", media_path)
+
+            if valid_media_paths:
+                media_upload_response = client.upload_media(valid_media_paths, media_category="tweet_image")
+                media_ids = media_upload_response.data["media_id"]
+            else:
+                log.warning("No valid media files provided for upload.")
+
 
         # Retry with exponential backoff for transient errors
         max_retries = 3
