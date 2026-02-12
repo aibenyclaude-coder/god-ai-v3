@@ -286,7 +286,7 @@ async def auto_tweet(client) -> bool:
         log.warning("auto_tweet: Generated tweet text is empty or whitespace, skipping.")
         return False
 
-    # Duplicate check (already checked in generate_tweet, but final confirmation)
+    # Check for duplicate tweets before posting
     tweet_history_texts = get_tweet_history()
     if tweet_text in tweet_history_texts:
         log.warning("auto_tweet: Generated tweet is a duplicate, skipping.")
