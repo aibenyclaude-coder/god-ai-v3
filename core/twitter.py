@@ -47,29 +47,37 @@ def get_client():
 
 def post_tweet(text: str) -> dict:
     """
-    ツイートを投稿する
+    Post a tweet with an appended call-to-action linking to the Coconala service page.
 
     Args:
-        text: ツイート本文（280文字以内推奨）
+        text: Tweet body (280 chars recommended limit)
 
     Returns:
-        dict: 投稿結果
+        dict: Post result
             - success: bool
-            - tweet_id: str (成功時)
-            - error: str (失敗時)
+            - tweet_id: str (on success)
+            - error: str (on failure)
     """
     if not text or not text.strip():
-        return {"success": False, "error": "ツイート本文が空です"}
+        return {"success": False, "error": "Tweet body is empty"}
 
     if not is_configured():
         return {
             "success": False,
-            "error": "Twitter API未設定。.envに以下を設定してください:\n"
+            "error": "Twitter API not configured. Set the following in .env:\n"
                      "TWITTER_API_KEY\n"
                      "TWITTER_API_SECRET\n"
                      "TWITTER_ACCESS_TOKEN\n"
                      "TWITTER_ACCESS_TOKEN_SECRET"
         }
+
+    # Append call-to-action with Coconala link if not already present
+    coconala_url = "https://coconala.com/services/4072452"
+    if coconala_url not in text:
+        cta_suffix = f"\n\nLP made by AI: {coconala_url}"
+        # Respect Twitter's 280 char limit
+        if len(text) + len(cta_suffix) <= 280:
+            text = text.rstrip() + cta_suffix
 
     try:
         client = get_client()
@@ -83,7 +91,7 @@ def post_tweet(text: str) -> dict:
     except ImportError as e:
         return {"success": False, "error": str(e)}
     except Exception as e:
-        return {"success": False, "error": f"ツイート投稿エラー: {e}"}
+        return {"success": False, "error": f"Tweet post error: {e}"}
 
 
 def get_setup_instructions() -> str:
