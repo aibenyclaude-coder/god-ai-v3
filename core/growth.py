@@ -1444,30 +1444,98 @@ CODE_IMPROVEMENTで関数名を指定する場合は、上の一覧にある関�
 
 # --- 定期振り返りスケジューラ ---
 async def reflection_scheduler(client: httpx.AsyncClient):
-    """定期的に振り返り実行"""
+    """Periodically run reflection cycles.
+
+    Before each reflection, checks for P1 (revenue) jobs in the queue.
+    If P1 jobs are pending or running, skips the regular reflection cycle
+    to yield CPU/API resources to self_growth_scheduler and job_worker
+    which handle P1 tasks. Also reads goals.md to detect revenue-phase
+    priorities and prepends a revenue-priority hint to the reflection.
+    """
     from god import tg_send
-    log.info(f"振り返りスケジューラ開始 (間隔: {REFLECTION_INTERVAL}秒)")
+    log.info(f"reflection_scheduler started (interval: {REFLECTION_INTERVAL}s)")
     while True:
         try:
             await asyncio.sleep(REFLECTION_INTERVAL)
-            log.info("定期振り返り: 開始")
+            log.info("Scheduled reflection: starting")
             if _reflecting:
-                log.warning("定期振り返り: 手動振り返り中のためスキップ")
+                log.warning("Scheduled reflection: skipped (manual reflection in progress)")
                 continue
-            await tg_send(client, f"定期振り返り開始... (次回: {REFLECTION_INTERVAL}秒後)")
+
+            # Check for P1 jobs in the queue; if present, skip reflection
+            # to yield resources for revenue-critical work
+            try:
+                jobs = load_queue()
+                p1_jobs = [
+                    j for j in jobs
+                    if j.get("priority") == "P1"
+                    and j.get("status") in ("queued", "running")
+                ]
+                if p1_jobs:
+                    p1_summaries = []
+                    for pj in p1_jobs[:3]:
+                        inp = pj.get("input", {})
+                        p1_summaries.append(
+                            f"{inp.get('target_file', 'unknown')}: {inp.get('instruction', '')[:60]}"
+                        )
+                    summary_text = "; ".join(p1_summaries)
+                    log.info(
+                        f"Scheduled reflection: skipped to yield resources for "
+                        f"{len(p1_jobs)} P1 job(s): {summary_text}"
+                    )
+                    await tg_send(
+                        client,
+                        f"Reflection skipped: {len(p1_jobs)} P1 job(s) active, "
+                        f"yielding resources.\n{summary_text[:200]}"
+                    )
+                    continue
+            except Exception as e:
+                log.warning(f"P1 job check failed, proceeding with reflection: {e}")
+
+            # Detect revenue-phase from goals.md to hint the reflection
+            revenue_hint = ""
+            try:
+                from config import GOALS_PATH
+                if GOALS_PATH.exists():
+                    goals_text = GOALS_PATH.read_text(encoding="utf-8")
+                    revenue_keywords = ["LP", "coconala", "revenue", "earning", "income"]
+                    if any(kw.lower() in goals_text.lower() for kw in revenue_keywords):
+                        revenue_hint = (
+                            "PRIORITY: Revenue-generating tasks detected in goals. "
+                            "Focus reflection on improvements that directly support "
+                            "revenue (LP creation, coconala, monetization features)."
+                        )
+                        log.info("Revenue-phase detected from goals.md, adding priority hint")
+            except Exception as e:
+                log.debug(f"Goals revenue detection skipped: {e}")
+
+            if revenue_hint:
+                await tg_send(
+                    client,
+                    f"Scheduled reflection starting (revenue-priority mode)... "
+                    f"(next: {REFLECTION_INTERVAL}s)"
+                )
+            else:
+                await tg_send(
+                    client,
+                    f"Scheduled reflection starting... (next: {REFLECTION_INTERVAL}s)"
+                )
+
             executed, result = await reflection_cycle(client)
             if executed:
                 summary = result[:1000] + "..." if len(result) > 1000 else result
-                await tg_send(client, f"定期振り返り完了。\n\n{summary}")
-                log.info("定期振り返り: 完了")
+                await tg_send(client, f"Scheduled reflection complete.\n\n{summary}")
+                log.info("Scheduled reflection: complete")
             else:
-                log.warning("定期振り返り: 他の振り返りと競合のためスキップ")
+                log.warning("Scheduled reflection: skipped (conflicting reflection)")
         except asyncio.CancelledError:
-            log.info("振り返りスケジューラ: キャンセルされました")
+            log.info("reflection_scheduler: cancelled")
             raise
         except Exception as e:
             log.error(f"Scheduled reflection failed: {e}", exc_info=True)
-            await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} 定期振り返りエラー\n{e}")
+            await safe_append_journal(
+                f"### {datetime.now().strftime('%H:%M')} Scheduled reflection error\n{e}"
+            )
             await asyncio.sleep(10)
 
 # --- 自己成長スケジューラ（3フェーズ版） ---
