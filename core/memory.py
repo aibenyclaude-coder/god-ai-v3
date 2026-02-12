@@ -174,11 +174,22 @@ async def safe_save_state(state: dict):
     Uses a lock to prevent concurrent writes, writes to a temp file
     first then atomically renames to prevent partial writes, and
     retries with exponential backoff on disk I/O errors.
+    Adds a timeout to the lock acquisition to prevent indefinite blocking.
     """
     max_retries = 3
     retry_delay = 0.5
+    lock_timeout = 5  # seconds to wait for the lock
 
-    async with get_write_lock():
+    try:
+        # Attempt to acquire the write lock with a timeout
+        lock_acquired = await asyncio.wait_for(get_write_lock(), timeout=lock_timeout)
+    except asyncio.TimeoutError:
+        log.error(
+            f"Timeout acquiring write lock for safe_save_state after {lock_timeout} seconds."
+        )
+        return  # Exit if lock cannot be acquired within timeout
+
+    try:
         for attempt in range(max_retries):
             try:
                 # Create a .bak backup of the current state file before overwriting
@@ -210,22 +221,27 @@ async def safe_save_state(state: dict):
                     state_str = state_str.replace(char, replacement)
 
                 # Write to a temporary file in the same directory, then atomically rename
+                # Use tempfile for atomic operations. Ensure it's in the same filesystem.
+                import tempfile
+                import os
+
                 dir_path = STATE_PATH.parent
+                # mkstemp creates a file and returns a file descriptor and path.
+                # We need to close the fd and then use os.replace for atomic rename.
                 fd, tmp_path = tempfile.mkstemp(
                     dir=str(dir_path), suffix=".tmp", prefix="state_"
                 )
                 try:
+                    # Write the encoded string to the temporary file.
                     os.write(fd, state_str.encode("utf-8"))
+                    # Ensure data is written to disk.
                     os.fsync(fd)
+                finally:
+                    # Close the file descriptor.
                     os.close(fd)
-                    fd = -1
-                    os.replace(tmp_path, str(STATE_PATH))
-                except BaseException:
-                    if fd >= 0:
-                        os.close(fd)
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-                    raise
+
+                # Atomically replace the target file with the temporary file.
+                os.replace(tmp_path, str(STATE_PATH))
 
                 # Success - exit retry loop
                 return
@@ -245,6 +261,10 @@ async def safe_save_state(state: dict):
             except Exception as e:
                 log.error(f"Failed to save state to {STATE_PATH}: {e}")
                 return
+    finally:
+        # Release the lock once done or if an error occurred
+        if get_write_lock().locked():
+            get_write_lock().release()
 
 async def safe_save_state(state: dict):
     async with get_write_lock():
