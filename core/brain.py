@@ -354,22 +354,22 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
 
 # --- 統合思考関数 ---
 async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
-    """統合思考関数。戻り値: (テキスト, 脳の名前)
+    """Unified thinking function. Returns: (text, brain_name)
 
     Raises:
-        AIUnavailable: AI一時停止中の場合
+        AIUnavailable: If the AI is paused.
     """
-    # AI一時停止チェック
+    # Check if AI is paused before proceeding.
     if is_ai_paused():
         remaining = get_ai_pause_remaining()
-        raise AIUnavailable(f"AI一時停止中（残り{remaining}秒）。claude setup-token を実行してください")
+        raise AIUnavailable(f"AI is currently paused (remaining {remaining} seconds). Please run 'claude setup-token'.")
 
     if heavy:
         try:
             return await think_claude(prompt)
         except ClaudeSessionExpired:
-            # Claude CLIセッション切れ → Geminiにフォールバック
-            log.warning("Claude CLI セッション切れ、Geminiにフォールバック")
+            # If Claude CLI session is expired, fall back to Gemini.
+            log.warning("Claude CLI session expired, falling back to Gemini.")
             return await think_gemini(prompt)
     return await think_gemini(prompt)
 
