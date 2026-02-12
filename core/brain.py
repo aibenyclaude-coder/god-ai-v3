@@ -315,9 +315,11 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                 return (result.stdout.strip(), "Claude CLI")
 
             stdout_full = result.stdout if result.stdout else "(empty)"
-            # Detect session expiration.
-            if "Not logged in" in stdout_full or "Error: You are not logged in" in stdout_full:
-                log.error("Claude CLI: Session expired. Re-login required (claude setup-token).")
+            stderr_full = result.stderr if result.stderr else "(empty)"
+
+            # Detect specific failure conditions.
+            if result.returncode == 1 and ("Error: You are not logged in" in stdout_full or "Not logged in" in stdout_full or "Session expired" in stdout_full):
+                log.error("Claude CLI: Session expired or not logged in.")
                 setup_success = False
                 try:
                     log.info("Attempting to run 'claude setup-token' to re-authenticate.")
@@ -347,8 +349,7 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                     # If setup failed, raise ClaudeSessionExpired to trigger fallback.
                     raise ClaudeSessionExpired("Claude CLI session expired and setup-token failed or timed out.")
 
-            # Log detailed error information for debugging.
-            stderr_full = result.stderr if result.stderr else "(empty)"
+            # Log detailed error information for debugging for non-session-expired errors.
             log.error(f"Claude CLI attempt {attempt+1}: returncode={result.returncode}, prompt_len={len(current_prompt)}, timeout={current_timeout}s")
             log.error(f"  stdout: {stdout_full[:500]}")
             log.error(f"  stderr: {stderr_full[:500]}")
