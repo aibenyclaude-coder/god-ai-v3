@@ -364,7 +364,7 @@ async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
         remaining = get_ai_pause_remaining()
         raise AIUnavailable(f"AI is currently paused (remaining {remaining} seconds).")
 
-    # Add a try-except block to catch potential errors from underlying AI calls
+    # Add a try-except block to gracefully handle exceptions during the execution of underlying AI calls
     try:
         if heavy:
             try:
