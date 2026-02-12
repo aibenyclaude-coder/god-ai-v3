@@ -73,7 +73,27 @@ def load_state() -> dict:
                 "children_count": 0, "uptime_start": None, "conversations_today": 0, "growth_cycles": 0}
 
 def save_state(state: dict):
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    """
+    Saves the AI's state to the state file.
+    Validates for full-width characters that could break JSON/Python syntax.
+    """
+    try:
+        # Check for invalid full-width characters that could break JSON/Python syntax
+        # Specifically looking for characters like '【' and '】' which caused issues.
+        state_str = json.dumps(state, ensure_ascii=False, indent=2)
+        if '【' in state_str or '】' in state_str:
+            log.error("Found invalid full-width characters in state data. Skipping save.")
+            # Optionally, try to sanitize the data here or log more details
+            # For now, we skip saving to prevent corruption.
+            return
+
+        STATE_PATH.write_text(state_str, encoding="utf-8")
+    except Exception as e:
+        log.error(f"Failed to save state to {STATE_PATH}: {e}")
+
+async def safe_save_state(state: dict):
+    async with get_write_lock():
+        save_state(state)
 
 async def safe_save_state(state: dict):
     async with get_write_lock():
