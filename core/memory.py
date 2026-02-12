@@ -9,7 +9,7 @@ from pathlib import Path
 
 from config import (
     STATE_PATH, JOURNAL_PATH, IDENTITY_PATH,
-    CONVERSATIONS_PATH, CONVERSATIONS_ARCHIVE_PATH, log
+    CONVERSATIONS_PATH, CONVERSATIONS_ARCHIVE_PATH, MEMORY_DIR, log
 )
 
 # --- asyncio.Lock（並行書き込み保護）---
@@ -46,9 +46,8 @@ def load_state() -> dict:
     If the file is not found or corrupted, returns a default state.
     Attempts to restore from backup if available.
     """
-    global MEMORY_DIR # Ensure MEMORY_DIR is accessible
     state_path = STATE_PATH
-    memory_dir = MEMORY_DIR # Use local variable for clarity
+    memory_dir = MEMORY_DIR
 
     if not state_path.exists():
         log.warning(f"State file not found at {state_path}. Attempting to restore from backup.")
@@ -136,6 +135,57 @@ def save_state(state: dict):
         STATE_PATH.write_text(state_str, encoding="utf-8")
     except Exception as e:
         log.error(f"Failed to save state to {STATE_PATH}: {e}")
+
+async def safe_save_state(state: dict, state_path: Path = STATE_PATH, memory_dir: Path | None = MEMORY_DIR):
+    """
+    Safely saves the AI's state to the specified state file path,
+    using a lock to prevent concurrent writes.
+    Validates for full-width characters that could break JSON/Python syntax.
+    """
+    async with get_write_lock():
+        try:
+            # Convert state to JSON string first, ensuring non-ASCII characters are preserved
+            state_str = json.dumps(state, ensure_ascii=False, indent=2)
+            
+            # Define problematic characters and their replacements.
+            # This dictionary can be expanded to cover a wider range of characters if issues arise.
+            # For now, focusing on commonly problematic full-width characters.
+            replacements = {
+                '【': '[',  # Replace opening full-width bracket with ASCII equivalent
+                '】': ']',  # Replace closing full-width bracket with ASCII equivalent
+                '！': '!',  # Replace full-width exclamation mark
+                '？': '?',  # Replace full-width question mark
+                '：': ':',  # Replace full-width colon
+                '；': ';',  # Replace full-width semicolon
+                '，': ',',  # Replace full-width comma
+                '．': '.',  # Replace full-width period
+                '（': '(',  # Replace full-width parenthesis open
+                '）': ')',  # Replace full-width parenthesis close
+                '｛': '{',  # Replace full-width brace open
+                '｝': '}',  # Replace full-width brace close
+                '「': '"',  # Replace full-width quote open
+                '」': '"',  # Replace full-width quote close
+                '‘': "'",  # Replace full-width apostrophe open
+                '’': "'",  # Replace full-width apostrophe close
+                '…': '...', # Replace full-width ellipsis
+            }
+            
+            # Apply replacements to the JSON string
+            for char, replacement in replacements.items():
+                state_str = state_str.replace(char, replacement)
+
+            # Write the cleaned string to the state file
+            state_path.write_text(state_str, encoding="utf-8")
+        except Exception as e:
+            log.error(f"Failed to save state to {state_path}: {e}")
+
+async def safe_save_state(state: dict):
+    async with get_write_lock():
+        save_state(state)
+
+async def safe_save_state(state: dict):
+    async with get_write_lock():
+        save_state(state)
 
 async def safe_save_state(state: dict):
     async with get_write_lock():
