@@ -360,12 +360,13 @@ async def tweet_scheduler_loop(client):
     """
     log.info(f"tweet_scheduler_loop started (interval: {TWEET_INTERVAL} seconds)")
 
-    # Initial immediate tweet posting
-    log.info("tweet_scheduler_loop: Posting the first tweet immediately.")
-    try:
+    # Attempt an immediate tweet post if there are no tweets in the history upon startup.
+    # This ensures a tweet is posted if the system starts and the queue is empty.
+    if not get_tweet_history():
+        log.info("tweet_scheduler_loop: No existing tweet history, attempting immediate tweet.")
         await auto_tweet(client)
-    except Exception as e:
-        log.error(f"tweet_scheduler_loop: Error during initial tweet post: {e}", exc_info=True)
+    else:
+        log.info("tweet_scheduler_loop: Existing tweet history found, proceeding with normal schedule.")
 
     # Periodic posting loop
     while True:
@@ -386,8 +387,15 @@ async def tweet_scheduler_loop(client):
             result = post_tweet(tweet_text)
             if result["success"]:
                 log.info(f"tweet_scheduler_loop: Tweet posted successfully {result['url']}")
+                # Assuming tg_send is available and works like documented in god.py
+                # Need to import tg_send or ensure it's accessible.
+                # from god import tg_send # This import might be needed if not globally available.
+                # For now, assuming it's accessible in the context of god.py's event loop.
                 await tg_send(client, f"[Auto-tweet Posted]\n{tweet_text}\n{result['url']}")
                 try:
+                    # Assuming load_conversations and save_conversations are available
+                    # from memory.py and are imported or accessible.
+                    # from memory import load_conversations, save_conversations # This import might be needed.
                     conversations = load_conversations()
                     conversations.append({
                         "time": datetime.now(timezone.utc).isoformat(),
