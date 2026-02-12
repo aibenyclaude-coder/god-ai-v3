@@ -263,7 +263,8 @@ async def auto_tweet(client) -> bool:
         return False
 
     tweet_text = await generate_tweet(client)
-    if not tweet_text:
+    if not tweet_text or not tweet_text.strip():
+        log.warning("auto_tweet: Generated tweet text is empty or whitespace, skipping.")
         return False
 
     # Duplicate check (already checked in generate_tweet, but final confirmation)
