@@ -274,7 +274,7 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
     段階的リトライ戦略:
     - 1回目: 同じプロンプトでリトライ
     - 2回目: プロンプトを短縮してリトライ（最後の1000文字のみ）
-    - 3回目: Geminiにフォールバック
+    - 3回目: Claude CLIのセットアップを試行し、成功すればリトライ。失敗したらGeminiにフォールバック。
     """
     global _claude_count
     loop = asyncio.get_running_loop()
@@ -319,7 +319,36 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
             stdout_full = result.stdout if result.stdout else "(empty)"
             if "Not logged in" in stdout_full:
                 log.error("Claude CLI: セッション切れ。再ログインが必要 (claude setup-token)")
-                raise ClaudeSessionExpired("Claude CLI session expired - run 'claude setup-token'")
+                # Attempt to re-authenticate
+                setup_success = False
+                try:
+                    log.info("Attempting to run 'claude setup-token' to re-authenticate.")
+                    setup_process = await loop.run_in_executor(
+                        None,
+                        lambda: subprocess.run(
+                            [CLAUDE_PATH, "setup-token"],
+                            capture_output=True, text=True, timeout=120,
+                            env=CLI_ENV,
+                        )
+                    )
+                    if setup_process.returncode == 0:
+                        log.info("Claude CLI setup-token completed successfully.")
+                        setup_success = True
+                    else:
+                        log.error(f"Claude CLI setup-token failed: {setup_process.stderr}")
+                except subprocess.TimeoutExpired:
+                    log.error("Claude CLI setup-token timed out.")
+                except Exception as e:
+                    log.error(f"An error occurred during Claude CLI setup-token: {e}")
+
+                if setup_success:
+                    # Retry the original prompt after successful setup
+                    log.info("Retrying Claude CLI with original prompt after successful setup-token.")
+                    # This will restart the loop to the first attempt with the original prompt.
+                    continue # This will break out of the current attempt's inner try block and restart the for loop
+                else:
+                    # If setup failed, raise ClaudeSessionExpired to trigger fallback.
+                    raise ClaudeSessionExpired("Claude CLI session expired and setup-token failed or timed out.")
 
             # 詳細なエラーログ（stdout/stderr両方、プロンプト長も）
             stderr_full = result.stderr if result.stderr else "(empty)"
@@ -342,6 +371,54 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                     log.error(f"Gemini fallback failed: {e}")
                     # If Gemini also fails, raise AIUnavailable to indicate complete failure
                     raise AIUnavailable(f"Claude CLI timed out and Gemini fallback failed: {e}") from e
+        except ClaudeSessionExpired as e:
+            log.error(f"Claude CLI session expired (attempt {attempt+1}): {e}")
+            # If ClaudeSessionExpired is caught here (and not from the "Not logged in" check),
+            # attempt setup-token and retry. If it fails, this exception will propagate to the next level.
+            if attempt < 2: # Only retry setup if not the last attempt
+                setup_success = False
+                try:
+                    log.info("Attempting to run 'claude setup-token' to re-authenticate after session expired.")
+                    setup_process = await loop.run_in_executor(
+                        None,
+                        lambda: subprocess.run(
+                            [CLAUDE_PATH, "setup-token"],
+                            capture_output=True, text=True, timeout=120,
+                            env=CLI_ENV,
+                        )
+                    )
+                    if setup_process.returncode == 0:
+                        log.info("Claude CLI setup-token completed successfully.")
+                        setup_success = True
+                    else:
+                        log.error(f"Claude CLI setup-token failed: {setup_process.stderr}")
+                except subprocess.TimeoutExpired:
+                    log.error("Claude CLI setup-token timed out.")
+                except Exception as e:
+                    log.error(f"An error occurred during Claude CLI setup-token: {e}")
+
+                if setup_success:
+                    log.info("Retrying Claude CLI with original prompt after successful setup-token.")
+                    continue # Restart the loop for the next attempt
+                else:
+                    log.error("Claude CLI setup-token failed. Falling back to Gemini.")
+                    # If setup fails, directly trigger fallback to Gemini.
+                    try:
+                        text, brain = await think_gemini(original_prompt) # Use original prompt for Gemini fallback
+                        return (text, f"{brain} (Claude fallback)")
+                    except Exception as gemini_fallback_e:
+                        log.error(f"Gemini fallback failed: {gemini_fallback_e}")
+                        raise AIUnavailable(f"Claude CLI session expired and setup failed. Gemini fallback also failed: {gemini_fallback_e}") from gemini_fallback_e
+            else:
+                # If this is the last attempt and ClaudeSessionExpired, fallback to Gemini
+                log.warning("Claude CLI session expired on last attempt, falling back to Gemini.")
+                try:
+                    text, brain = await think_gemini(original_prompt)
+                    return (text, f"{brain} (Claude fallback)")
+                except Exception as e:
+                    log.error(f"Gemini fallback failed: {e}")
+                    raise AIUnavailable(f"Claude CLI session expired and last attempt failed. Gemini fallback also failed: {e}") from e
+
         except Exception as e:
             log.error(f"Claude CLI attempt {attempt+1}: {e}")
 
