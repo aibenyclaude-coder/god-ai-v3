@@ -280,6 +280,25 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
     original_prompt = prompt
 
+    # Shorten prompt for LP content generation if it's not already specific
+    # This ensures the AI focuses on the Coconala promotion aspect.
+    coconala_lp_instruction = (
+        "[GOAL: Drive traffic to Coconala for service inquiries.] "
+        "Generate compelling content that persuades users to visit Coconala. "
+        "Specifically highlight the benefits of using Coconala for finding "
+        "and inquiring about services. Focus on calls to action that direct users to "
+        "the Coconala platform. Ensure the output is direct, engaging, and conversion-focused.\n\n"
+    )
+    # Check if the prompt already contains specific LP/Coconala instructions.
+    # If not, prepend our specific instruction.
+    if "coconala" not in original_prompt.lower() and "lp" not in original_prompt.lower() and "landing page" not in original_prompt.lower():
+        log.info("Prepending Coconala LP instruction to Claude prompt.")
+        modified_prompt = coconala_lp_instruction + original_prompt
+    else:
+        modified_prompt = original_prompt
+        log.info("Prompt already contains LP/Coconala related terms, not prepending specific instruction.")
+
+
     # Incremental timeout settings and retry intervals.
     timeouts = [60, 90, 120]
     sleep_between_retries = 5
@@ -288,10 +307,10 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
         current_timeout = timeouts[attempt]
 
         # Shorten prompt on subsequent attempts to reduce chances of timeout.
-        current_prompt = original_prompt
-        if attempt >= 1 and len(original_prompt) > 1000:
-            current_prompt = "...(truncated)...\n" + original_prompt[-1000:]
-            log.warning(f"Claude CLI attempt {attempt+1}: Prompt truncated ({len(original_prompt)} -> {len(current_prompt)} chars)")
+        current_prompt = modified_prompt
+        if attempt >= 1 and len(modified_prompt) > 1000:
+            current_prompt = "...(truncated)...\n" + modified_prompt[-1000:]
+            log.warning(f"Claude CLI attempt {attempt+1}: Prompt truncated ({len(modified_prompt)} -> {len(current_prompt)} chars)")
 
         try:
             # Execute Claude CLI command in a separate thread to avoid blocking the event loop.
@@ -325,7 +344,7 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                 try:
                     text, brain = await think_gemini(original_prompt) # Use original prompt for Gemini fallback
                     log.info(f"Gemini fallback success from Claude CLI failure.")
-                    return (text, f"{brain} (Claude fallback)")
+                    return (text, f"{brain} (fallback)")
                 except Exception as gemini_fallback_e:
                     log.error(f"Gemini fallback failed: {gemini_fallback_e}", exc_info=True)
                     # If Gemini also fails, raise an AIUnavailable exception.
@@ -375,7 +394,7 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
             try:
                 text, brain = await think_gemini(original_prompt)
                 log.info(f"Gemini fallback success from Claude CLI timeout.")
-                return (text, f"{brain} (Claude fallback)")
+                return (text, f"{brain} (fallback)")
             except Exception as e:
                 log.error(f"Gemini fallback failed: {e}", exc_info=True)
                 raise AIUnavailable(f"Claude CLI timed out and Gemini fallback failed: {e}") from e
@@ -411,7 +430,7 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                     log.error("Claude CLI setup-token failed. Falling back to Gemini.")
                     try:
                         text, brain = await think_gemini(original_prompt) # Use original prompt for Gemini fallback
-                        return (text, f"{brain} (Claude fallback)")
+                        return (text, f"{brain} (fallback)")
                     except Exception as gemini_fallback_e:
                         log.error(f"Gemini fallback failed: {gemini_fallback_e}", exc_info=True)
                         raise AIUnavailable(f"Claude CLI session expired and setup failed. Gemini fallback also failed: {gemini_fallback_e}") from gemini_fallback_e
@@ -420,7 +439,7 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                 log.warning("Claude CLI session expired on last attempt, falling back to Gemini.")
                 try:
                     text, brain = await think_gemini(original_prompt)
-                    return (text, f"{brain} (Claude fallback)")
+                    return (text, f"{brain} (fallback)")
                 except Exception as e:
                     log.error(f"Gemini fallback failed: {e}", exc_info=True)
                     raise AIUnavailable(f"Claude CLI session expired and last attempt failed. Gemini fallback also failed: {e}") from e
