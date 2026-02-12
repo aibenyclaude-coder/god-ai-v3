@@ -581,43 +581,80 @@ def _generate_claude_md_content(
 
 
 # --- 改善対象モジュールの自動選択 ---
-def select_target_module(improvement_text: str) -> tuple[Path, str] | None:
-    """改善内容から対象モジュールを自動選択。戻り値: (モジュールパス, モジュール名) or None（無効な場合）"""
-    improvement_lower = improvement_text.lower()
+def select_target_module() -> Path:
+    """
+    Select a module for self-improvement.
 
-    # キーワードマッチングでモジュール選択
-    if any(kw in improvement_lower for kw in ["振り返り", "reflection", "自己改善", "growth", "improve"]):
-        module_name = "growth"
-    elif any(kw in improvement_lower for kw in ["gemini", "claude", "think", "脳", "brain", "ai", "timeout"]):
-        module_name = "brain"
-    elif any(kw in improvement_lower for kw in ["memory", "state", "journal", "保存", "読み込み"]):
-        module_name = "memory"
-    elif any(kw in improvement_lower for kw in ["queue", "job", "キュー", "priority"]):
-        module_name = "jobqueue"
-    elif any(kw in improvement_lower for kw in ["config", "設定", "定数", "env"]):
-        module_name = "config"
-    elif any(kw in improvement_lower for kw in ["handoff", "引き継ぎ"]):
-        module_name = "handoff"
-    elif any(kw in improvement_lower for kw in ["drive", "google", "upload", "backup"]):
-        module_name = "gdrive"
-    elif any(kw in improvement_lower for kw in ["twitter", "tweet", "ツイート", "x連携"]):
-        module_name = "twitter"
-    elif any(kw in improvement_lower for kw in ["telegram", "polling", "メイン", "main", "god"]):
-        module_name = "god"
-    else:
-        module_name = "god"  # デフォルト
+    Prioritizes modules that are not core system components (like 'gmail' or 'god')
+    and are likely to benefit from improvement.
+    """
+    # Check for pending self-improvement jobs
+    if get_queued_job_summaries(job_type="self_improve"):
+        log.info("Self-improvement job already in queue. Skipping module selection.")
+        return Path("")  # Indicate no new module to select
 
-    # 存在チェック
-    if module_name not in VALID_MODULES:
-        log.warning(f"無効なモジュール名: {module_name}")
-        return None
+    modules = [
+        p
+        for p in BASE_DIR.rglob("*.py")
+        if p.is_file()
+        and not any(
+            x in str(p) for x in ["__init__.py", "config.py", "memory.py", "brain.py", "jobqueue.py", "job_worker.py", "growth.py", "gdrive.py", "god.py", "gmail.py"]
+        )
+        and not str(p).startswith(str(MEMORY_DIR))
+    ]
+    if not modules:
+        log.warning("No modules found for self-improvement.")
+        return Path("")
 
-    module_path = MODULE_PATHS[module_name]
-    if not module_path.exists():
-        log.warning(f"モジュールファイルが存在しない: {module_path}")
-        return None
+    # Calculate a 'score' for each module based on recency of change and usage
+    scores = {}
+    for module_path in modules:
+        score = 0
+        try:
+            # Recent git commit
+            commit_date_str = (
+                subprocess.check_output(
+                    ["git", "log", "-1", "--format=%ci", str(module_path)],
+                    cwd=BASE_DIR,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+                .strip()
+                .split(" ")[0]
+            )
+            commit_date = datetime.strptime(commit_date_str, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+            days_since_commit = (datetime.now(timezone.utc) - commit_date).days
+            score += max(0, 30 - days_since_commit)  # Higher score for recent commits
 
-    return (module_path, module_name)
+            # Check if the module has been run recently (heuristic)
+            # This is a very basic heuristic and can be improved
+            # For now, we rely more on git history and avoid core modules
+            # if module_path.stat().st_mtime > time_module.time() - (7 * 24 * 60 * 60): # Modified in last 7 days
+            #     score += 5
+        except subprocess.CalledProcessError:
+            pass  # Ignore if git commands fail
+
+        # Avoid core system modules if possible
+        if any(keyword in str(module_path) for keyword in ["gmail", "god"]):
+            score = -1000  # Heavily penalize core system modules
+
+        scores[module_path] = score
+
+    # Sort modules by score in descending order
+    sorted_modules = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+    # Select the module with the highest score
+    target_module = sorted_modules[0][0]
+
+    if scores[target_module] < 0:  # If the best module is still heavily penalized
+        log.warning(f"No suitable module found for self-improvement. Best module score: {scores[target_module]}")
+        return Path("")
+
+    log.info(f"Selected module for self-improvement: {target_module} (Score: {scores[target_module]})")
+    return target_module
 
 
 # --- バックアップ管理 ---
