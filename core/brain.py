@@ -316,7 +316,7 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
 
             stdout_full = result.stdout if result.stdout else "(empty)"
             # Detect session expiration.
-            if "Not logged in" in stdout_full:
+            if "Not logged in" in stdout_full or "Error: You are not logged in" in stdout_full:
                 log.error("Claude CLI: Session expired. Re-login required (claude setup-token).")
                 setup_success = False
                 try:
