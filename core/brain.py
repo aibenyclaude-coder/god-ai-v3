@@ -117,7 +117,7 @@ GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GOOGLE_AI_KEY}"
 
 async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
-    """Geminiで思考（429リトライ付き）。戻り値: (テキスト, 脳の名前)
+    """Geminiで思考（429/503リトライ付き）。戻り値: (テキスト, 脳の名前)
 
     フォールバック順序: Gemini → GLM-4 → Claude CLI
 
@@ -171,16 +171,17 @@ async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
                 retry_delay = initial_retry_delay
                 return (text, f"Gemini {GEMINI_MODEL}")
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                log.warning(f"Gemini 429 rate limit, attempt {attempt+1}/{max_retries}, waiting {retry_delay}s...")
+            if e.response.status_code in (429, 503):
+                error_code = e.response.status_code
+                log.warning(f"Gemini {error_code} error (attempt {attempt+1}/{max_retries}), waiting {retry_delay}s...")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     # Exponential backoff
                     retry_delay = min(retry_delay * 2, max_retry_delay)
                     continue
                 else:
-                    log.error("Gemini 429 rate limit exceeded after retries.")
-                    raise Exception("Gemini 429 rate limit exceeded after retries") from e
+                    log.error(f"Gemini {error_code} error after retries.")
+                    raise Exception(f"Gemini {error_code} error after retries") from e
             else:
                 # Handle other HTTP errors
                 log.error(f"Gemini HTTP error (attempt {attempt+1}): {e.response.status_code} - {e.response.text}", exc_info=True)
