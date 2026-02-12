@@ -22,7 +22,7 @@ from pathlib import Path
 
 import httpx
 
-from config import log, BASE_DIR, CORE_DIR, IDENTITY_PATH, JOURNAL_PATH, MEMORY_DIR
+from config import log, BASE_DIR, CORE_DIR, IDENTITY_PATH, JOURNAL_PATH, MEMORY_DIR, GOALS_PATH
 from jobqueue import (
     get_next_queued_job, update_job, create_job,
     is_p1_interrupted, clear_p1_interrupt,
@@ -323,29 +323,39 @@ def parse_plan(result_text: str) -> dict | None:
         return None
 
 
-async def _generate_code_with_cli(prompt: str, timeout: int = 120) -> str:
-    """Claude CLIでコード生成。高品質なコード出力用。
+async def _generate_code_with_cli(prompt: str, timeout: int = 180) -> str:
+    """Generate code using Claude CLI with retry logic and exponential backoff.
+
+    Retries up to 3 times with exponential backoff (5s, 15s, 45s) when Claude CLI
+    fails due to session expiration or transient errors, before allowing the caller
+    to fall back to Gemini.
 
     Args:
-        prompt: コード生成プロンプト
-        timeout: タイムアウト秒数（デフォルト120秒）
+        prompt: Code generation prompt
+        timeout: Timeout in seconds per attempt (default 180s)
 
     Returns:
-        生成されたテキスト（stdout）
+        Generated text (stdout)
 
     Raises:
-        RuntimeError: CLI実行失敗時
-        subprocess.TimeoutExpired: タイムアウト時
+        RuntimeError: CLI execution failure after all retries exhausted
+        subprocess.TimeoutExpired: Timeout on final attempt
     """
     loop = asyncio.get_running_loop()
-    env = {
-        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        "HOME": "/Users/beny",
-    }
+    import os as _os
+    env = _os.environ.copy()
+    env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "/usr/bin:/bin")
+
+    concise_prefix = "Be concise. Output ONLY the function code, no explanation.\n\n"
+    full_prompt = concise_prefix + prompt
+
+    max_attempts = 3
+    base_backoff = 5  # seconds
 
     def _run():
         proc = subprocess.run(
-            ["/opt/homebrew/bin/claude", "--print", "-p", prompt],
+            ["/opt/homebrew/bin/claude", "--print"],
+            input=full_prompt,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -357,7 +367,42 @@ async def _generate_code_with_cli(prompt: str, timeout: int = 120) -> str:
             raise RuntimeError("Claude CLI returned empty output")
         return proc.stdout
 
-    return await loop.run_in_executor(None, _run)
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await loop.run_in_executor(None, _run)
+            if attempt > 1:
+                log.info(f"Claude CLI succeeded on retry attempt {attempt}/{max_attempts}")
+            return result
+        except subprocess.TimeoutExpired:
+            # Timeout on final attempt: raise immediately
+            if attempt == max_attempts:
+                raise
+            last_error = f"Timeout on attempt {attempt}"
+            log.warning(f"Claude CLI timeout on attempt {attempt}/{max_attempts}, retrying...")
+        except RuntimeError as e:
+            error_msg = str(e).lower()
+            # Check for transient/session errors that are worth retrying
+            is_transient = any(keyword in error_msg for keyword in [
+                "session", "expired", "auth", "token",
+                "overloaded", "rate limit", "503", "502", "429",
+                "connection", "timeout", "unavailable",
+            ])
+            if not is_transient or attempt == max_attempts:
+                raise
+            last_error = str(e)
+            log.warning(
+                f"Claude CLI transient error on attempt {attempt}/{max_attempts}: "
+                f"{str(e)[:150]}, retrying..."
+            )
+
+        # Exponential backoff: 5s, 15s, 45s
+        backoff = base_backoff * (3 ** (attempt - 1))
+        log.info(f"Claude CLI backoff: waiting {backoff}s before attempt {attempt + 1}")
+        await asyncio.sleep(backoff)
+
+    # Should not reach here, but safety net
+    raise RuntimeError(f"Claude CLI failed after {max_attempts} attempts: {last_error}")
 
 
 def _count_consecutive_errors(module: str) -> int:
@@ -602,13 +647,15 @@ async def _execute_self_improve(client: httpx.AsyncClient, job: dict) -> bool:
     identity_text = "(identity.mdなし)"
     try:
         if IDENTITY_PATH.exists():
-            identity_text = IDENTITY_PATH.read_text(encoding="utf-8")
+            full_identity = IDENTITY_PATH.read_text(encoding="utf-8")
+            identity_lines = full_identity.splitlines()[:20]
+            identity_text = "\n".join(identity_lines)
     except Exception as e:
         log.warning(f"identity.md読み込み失敗: {e}")
 
     journal_recent = "(journalなし)"
     try:
-        journal_recent = read_file(JOURNAL_PATH, tail=10) or "(journalなし)"
+        journal_recent = read_file(JOURNAL_PATH, tail=5) or "(journalなし)"
     except Exception as e:
         log.warning(f"journal読み込み失敗: {e}")
 
@@ -766,7 +813,7 @@ async def _execute_self_improve(client: httpx.AsyncClient, job: dict) -> bool:
             # --- Step 3: Claude CLIでコード生成（1st）→ Geminiフォールバック ---
             brain_used = ""
             try:
-                gen_result = await _generate_code_with_cli(prompt, timeout=120)
+                gen_result = await _generate_code_with_cli(prompt, timeout=180)
                 brain_used = "claude-cli"
                 log.info(f"[Step 3] 試行{attempt}: Claude CLI成功")
             except Exception as cli_err:
@@ -1238,8 +1285,18 @@ async def _execute_analyze_plan(client: httpx.AsyncClient, report: dict) -> bool
         queued_lines = [f"  - [{qj['status']}] {qj['target_file']}: {qj['instruction']}" for qj in queued_jobs]
         queued_text = "\n".join(queued_lines)
 
+    # Load goals.md for self-improvement rules
+    goals_text = ""
+    try:
+        if GOALS_PATH.exists():
+            goals_text = GOALS_PATH.read_text(encoding="utf-8")
+    except Exception as e:
+        log.warning(f"analyze_plan: goals.md読み込み失敗: {e}")
+
     prompt = (
-        "You are God AI's code analyzer. Based on this research report, identify exactly 3 REAL problems "
+        "You are God AI's code analyzer. Follow the goals and rules below to propose improvements.\n\n"
+        f"[Goals & Self-Improvement Rules]\n{goals_text}\n\n"
+        "Based on this research report, identify exactly 3 REAL problems "
         "that can be fixed by modifying a SINGLE existing function.\n\n"
         f"[Codebase Structure]\n{modules_text}\n\n"
         f"[Module Dependencies]\n{deps_text}\n\n"
@@ -1263,12 +1320,14 @@ async def _execute_analyze_plan(client: httpx.AsyncClient, report: dict) -> bool
         "description: one-line description\n"
         "<<<END_3>>>\n\n"
         "RULES:\n"
+        "- FORBIDDEN modules: god, memory (these crash the entire system if modified)\n"
         "- Each function name MUST exist in the codebase structure above\n"
         "- Each improvement must target a DIFFERENT module\n"
-        "- Focus on real issues visible in the error logs or code structure\n"
+        "- Focus on improvements that directly contribute to P1 (revenue) goals\n"
+        "- Do NOT propose error handling additions or log additions (these are NOT improvements)\n"
         "- Do NOT propose improvements already queued or recently failed\n"
         "- Be specific: name the exact function and what to change\n"
-        "- Prioritize: error handling, robustness, performance\n"
+        "- Prioritize: new capabilities > code quality fixes\n"
     )
 
     try:
@@ -1303,6 +1362,11 @@ async def _execute_analyze_plan(client: httpx.AsyncClient, report: dict) -> bool
 
         if not module_name or not func_name or not description:
             log.warning(f"analyze_plan: Incomplete improvement #{i}: {fields}")
+            continue
+
+        # Validate: forbidden modules (god, memory are critical and must not be modified)
+        if module_name in ("god", "memory"):
+            log.warning(f"analyze_plan: Module '{module_name}' is forbidden for improvement #{i}")
             continue
 
         # Validate: module exists
@@ -1351,11 +1415,15 @@ async def _execute_analyze_plan(client: httpx.AsyncClient, report: dict) -> bool
         else:
             log.info(f"analyze_plan: Duplicate job skipped #{i}: {module_name}.py/{func_name}")
 
+    # --- Roadmap implementation jobs (P2, higher priority than code quality P3) ---
+    roadmap_created = await _create_roadmap_jobs(client, modules_text, queued_text, failed_text)
+    improvements_created += roadmap_created
+
     if improvements_created > 0:
-        await tg_send(client, f"Research->Analyze complete: {improvements_created} improvement jobs created")
+        await tg_send(client, f"Research->Analyze complete: {improvements_created} jobs (roadmap={roadmap_created})")
         await safe_append_journal(
             f"### {datetime.now().strftime('%H:%M')} Research->Analyze complete\n"
-            f"Improvement jobs created: {improvements_created}"
+            f"Improvement jobs: {improvements_created - roadmap_created}, Roadmap jobs: {roadmap_created}"
         )
     else:
         log.warning("analyze_plan: No valid improvements created")
@@ -1364,3 +1432,144 @@ async def _execute_analyze_plan(client: httpx.AsyncClient, report: dict) -> bool
         )
 
     return improvements_created > 0
+
+
+async def _create_roadmap_jobs(
+    client: httpx.AsyncClient,
+    modules_text: str,
+    queued_text: str,
+    failed_text: str,
+) -> int:
+    """goals.mdのロードマップから最初の未完了タスクを見つけ、実装ジョブを作成する。"""
+    from god import tg_send
+
+    # 1. goals.mdを読む
+    try:
+        if not GOALS_PATH.exists():
+            log.info("roadmap: goals.md not found")
+            return 0
+        goals_text = GOALS_PATH.read_text(encoding="utf-8")
+    except Exception as e:
+        log.warning(f"roadmap: goals.md読み込み失敗: {e}")
+        return 0
+
+    # 2. Roadmapセクションから最初の未完了タスクを見つける
+    roadmap_task = None
+    in_roadmap = False
+    for line in goals_text.splitlines():
+        if "## Roadmap" in line:
+            in_roadmap = True
+            continue
+        if in_roadmap and line.startswith("## ") and "Roadmap" not in line:
+            break
+        if in_roadmap and "- [ ] " in line:
+            roadmap_task = line.strip().replace("- [ ] ", "").strip()
+            break
+
+    if not roadmap_task:
+        log.info("roadmap: No uncompleted tasks found")
+        return 0
+
+    log.info(f"roadmap: Next task = {roadmap_task}")
+
+    # 3. Geminiに実装計画を聞く
+    prompt = (
+        "You are God AI's implementation planner.\n\n"
+        f"[Task to implement]\n{roadmap_task}\n\n"
+        f"[Codebase Structure]\n{modules_text}\n\n"
+        f"[Already queued (DO NOT duplicate)]\n{queued_text}\n\n"
+        f"[Recently failed (DO NOT repeat)]\n{failed_text}\n\n"
+        "Propose exactly ONE code change to implement this task.\n"
+        "Choose an EXISTING function to modify (or the most relevant existing function to extend).\n\n"
+        "CRITICAL ARCHITECTURE RULE:\n"
+        "- god.py and memory.py CANNOT be modified directly. They are core infrastructure.\n"
+        "- New features MUST be implemented in helper modules (twitter.py, brain.py, growth.py, "
+        "job_worker.py, config.py, jobqueue.py, gmail.py, gdrive.py, handoff.py, etc.).\n"
+        "- god.py only imports and calls functions from helper modules.\n"
+        "- Example: To improve tweet scheduling, add generate_tweet() or check_duplicate_tweet() to twitter.py.\n"
+        "- If the task naturally belongs in god.py, find the corresponding helper module and implement there.\n"
+        "  god.py will import and call it.\n\n"
+        "Output in this EXACT format:\n\n"
+        "<<<ROADMAP_TASK>>>\n"
+        "module: module_name (without .py, MUST NOT be god or memory)\n"
+        "function: existing_function_name\n"
+        "description: specific implementation instruction (1-2 sentences)\n"
+        "<<<END_ROADMAP>>>\n\n"
+        "RULES:\n"
+        "- FORBIDDEN modules: god, memory (these crash the entire system if modified)\n"
+        "- Do NOT skip a task just because it seems related to god.py. Instead, redirect it to the appropriate helper module.\n"
+        "- The function MUST exist in the codebase structure above\n"
+        "- Be very specific about what code to add/change\n"
+        "- Focus on the minimal change needed to implement the task\n"
+    )
+
+    try:
+        result, brain_name = await think_gemini(prompt, max_tokens=1024)
+        log.info(f"roadmap: Gemini response received ({brain_name})")
+    except Exception as e:
+        log.error(f"roadmap: Gemini failed: {e}")
+        return 0
+
+    # 4. パースしてジョブ作成
+    if "<<<ROADMAP_TASK>>>" not in result or "<<<END_ROADMAP>>>" not in result:
+        log.warning("roadmap: Invalid response format from Gemini")
+        return 0
+
+    block = result.split("<<<ROADMAP_TASK>>>", 1)[1].split("<<<END_ROADMAP>>>", 1)[0].strip()
+    fields = {}
+    for line in block.splitlines():
+        line = line.strip()
+        if ":" in line:
+            key, value = line.split(":", 1)
+            fields[key.strip().lower()] = value.strip()
+
+    module_name = fields.get("module", "")
+    func_name = fields.get("function", "")
+    description = fields.get("description", "")
+
+    if not module_name or not func_name or not description:
+        log.warning(f"roadmap: Incomplete fields: {fields}")
+        return 0
+
+    if module_name in ("god", "memory"):
+        log.warning(f"roadmap: Forbidden module '{module_name}'")
+        return 0
+
+    if module_name not in MODULE_PATHS:
+        log.warning(f"roadmap: Invalid module '{module_name}'")
+        return 0
+
+    module_path = MODULE_PATHS[module_name]
+    if not module_path.exists():
+        log.warning(f"roadmap: Module not found: {module_path}")
+        return 0
+
+    try:
+        mod_code = module_path.read_text(encoding="utf-8")
+        mod_funcs = _extract_function_names(mod_code)
+        if func_name not in mod_funcs:
+            log.warning(f"roadmap: Function '{func_name}' not in {module_name}.py. Available: {', '.join(mod_funcs[:10])}")
+            return 0
+    except Exception as e:
+        log.warning(f"roadmap: Failed to read {module_name}.py: {e}")
+        return 0
+
+    instruction = f"[ROADMAP] {roadmap_task} - {module_name}.py: {func_name} - {description}"
+    dep_files = _detect_read_files(module_path, module_name)
+
+    new_job = create_job(
+        job_type="self_improve",
+        priority="P2",
+        target_file=f"core/{module_name}.py",
+        read_files=dep_files,
+        instruction=instruction,
+        constraints=["構文チェック必須", "テスト必須"],
+        max_retries=3,
+    )
+
+    if new_job:
+        log.info(f"roadmap: Created P2 job: {module_name}.py/{func_name} for '{roadmap_task}'")
+        return 1
+    else:
+        log.info(f"roadmap: Duplicate job skipped for '{roadmap_task}'")
+        return 0
