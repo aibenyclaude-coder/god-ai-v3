@@ -330,6 +330,13 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
 
     while True:
         try:
+            # Check if AI is paused and skip polling if necessary
+            if is_ai_paused():
+                pause_remaining = get_ai_pause_remaining()
+                log.info(f"AI is paused. Skipping polling for {pause_remaining:.0f} seconds.")
+                await asyncio.sleep(min(pause_remaining, 60)) # Sleep for at most 60 seconds or remaining pause time
+                continue
+
             resp = await client.post(f"{TG_BASE}/getUpdates", json={"offset": offset, "timeout": 30}, timeout=60)
             resp.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
             data = resp.json()
@@ -355,6 +362,8 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                 # P1割り込みシグナル発行（自己改善を中断させる）
                 signal_p1_interrupt()
                 conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "beny", "text": text})
+
+                # Handle reflective commands first
                 if text.strip() == "/reflect":
                     if is_reflecting():
                         await tg_send(client, "振り返り中です。しばらくお待ちください。")
@@ -370,10 +379,15 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                         else:
                             await tg_send(client, "振り返り中のためスキップしました。")
                     continue
-                pending = await tg_send(client, "...")
-                if not pending:
-                    continue
+
+                # Attempt to handle general messages via AI
+                pending_message_id = None
                 try:
+                    pending = await tg_send(client, "...")
+                    if not pending:
+                        continue
+                    pending_message_id = pending["message_id"]
+
                     response = await handle_message(client, text)
                 except AIUnavailable as e:
                     # Gemini 429 + Claude CLIセッション切れ → 特別な通知
@@ -381,10 +395,19 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
                     log.error(f"AIUnavailable: {e}")
                     record_system_action(conversations, f"AI停止: {e}")
                 except Exception as e:
-                    response = f"エラー: {e}"; log.error(f"handle_message failed: {e}")
+                    response = f"エラー: {e}"; log.error(f"handle_message failed: {e}", exc_info=True)
                     # エラーをシステムアクションとして記録
                     record_system_action(conversations, f"エラー発生: {e}")
-                await tg_edit(client, pending["message_id"], response)
+                    # If an error occurred and we sent a placeholder message, edit it with the error
+                    if pending_message_id:
+                        await tg_edit(client, pending_message_id, response)
+                    else: # If no placeholder was sent, send error as new message
+                        await tg_send(client, response)
+                    continue # Continue to the next update
+
+                if pending_message_id:
+                    await tg_edit(client, pending_message_id, response)
+
                 conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "god", "text": response[:500]})
                 # ツイート投稿成功をシステムアクションとして記録
                 if "ツイート投稿完了" in response:
