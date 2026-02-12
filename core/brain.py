@@ -371,39 +371,31 @@ async def think(prompt: str, heavy: bool = False, bias_to_x_lp: bool = False) ->
         remaining = get_ai_pause_remaining()
         raise AIUnavailable(f"AI is currently paused (remaining {remaining} seconds).")
 
-    # Auto-detect LP/landing page/copywriting tasks and upgrade to heavy mode
-    # Claude CLI produces higher-quality long-form content for these tasks
-    if not heavy:
-        lp_task_keywords = [
-            "landing page", "lp", "copywriting", "sales copy",
-            "persuasive", "conversion", "headline", "cta",
-            "call to action", "lead magnet", "sales letter",
-            "product description", "service page",
-        ]
-        prompt_lower = prompt.lower()
-        if any(kw in prompt_lower for kw in lp_task_keywords):
-            heavy = True
-            log.info("LP/copywriting task detected in prompt, upgrading to heavy mode (Claude CLI) for better quality.")
+    # Dynamically prepend instructions based on goals or explicit bias.
+    augmented_prompt = prompt
+    prepended_instruction = False
 
-    # Prepend instruction if bias_to_x_lp is True
+    # 1. Check if bias_to_x_lp is explicitly True.
     if bias_to_x_lp:
         x_lp_instruction = (
             "[PRIORITY] Focus on generating content specifically for X (formerly Twitter) posts and "
             "Landing Page (LP) proposals. Prioritize conciseness, engagement, and conversion-oriented "
             "language suitable for these platforms. Ensure output is ready for immediate use.\n\n"
         )
-        prompt = x_lp_instruction + prompt
+        augmented_prompt = x_lp_instruction + augmented_prompt
         log.info("bias_to_x_lp is True, prepended specific instruction to prompt.")
+        prepended_instruction = True
 
-    # Check if current goal is revenue generation and prepend LP priority instruction
+    # 2. Check if current goal is revenue generation and prepend LP priority instruction.
+    # This check should only apply if bias_to_x_lp was not already explicitly set.
     try:
         from config import GOALS_PATH
-        if GOALS_PATH.exists():
+        if GOALS_PATH.exists() and not prepended_instruction:
             goals_text = GOALS_PATH.read_text(encoding="utf-8")
             # Detect revenue-focused phase from goals
             revenue_keywords = ["LP", "coconala", "revenue", "earning", "income"]
             is_revenue_phase = any(kw.lower() in goals_text.lower() for kw in revenue_keywords)
-            if is_revenue_phase and not bias_to_x_lp: # Avoid double-prepending if bias_to_x_lp is already set
+            if is_revenue_phase:
                 state = load_state()
                 current_task = state.get("current_task")
                 # Only prepend LP instruction when no specific task is set
@@ -419,40 +411,55 @@ async def think(prompt: str, heavy: bool = False, bias_to_x_lp: bool = False) ->
                         "When generating content, prioritize high-quality LP (landing page) material, "
                         "persuasive copy, and actionable output suitable for Coconala service delivery.\n\n"
                     )
-                    prompt = lp_instruction + prompt
+                    augmented_prompt = lp_instruction + augmented_prompt
                     log.info("Revenue generation goal detected, prepended LP priority instruction to prompt.")
+                    prepended_instruction = True # Mark as prepended to avoid double-prefixing
     except Exception as e:
         log.warning(f"Failed to check revenue goal status: {e}")
+
+    # Auto-detect LP/landing page/copywriting tasks and upgrade to heavy mode
+    # Claude CLI produces higher-quality long-form content for these tasks
+    if not heavy:
+        lp_task_keywords = [
+            "landing page", "lp", "copywriting", "sales copy",
+            "persuasive", "conversion", "headline", "cta",
+            "call to action", "lead magnet", "sales letter",
+            "product description", "service page",
+        ]
+        prompt_lower = prompt.lower() # Use original prompt for detection
+        if any(kw in prompt_lower for kw in lp_task_keywords):
+            heavy = True
+            log.info("LP/copywriting task detected in prompt, upgrading to heavy mode (Claude CLI) for better quality.")
 
     # Attempt to use AI models, with fallbacks and specific error handling.
     try:
         if heavy:
             # For heavy tasks, prioritize Claude CLI, then Gemini.
             try:
-                return await think_claude(prompt)
+                return await think_claude(augmented_prompt)
             except ClaudeSessionExpired:
                 log.warning("Claude CLI session expired, falling back to Gemini.")
                 # If Claude session expired, fallback to Gemini immediately.
-                return await think_gemini(prompt)
+                return await think_gemini(augmented_prompt)
             except Exception as e:
                 # Catch any other exceptions from think_claude and fallback to Gemini.
                 log.error(f"Error in think_claude during heavy task: {e}. Falling back to Gemini.", exc_info=True)
-                return await think_gemini(prompt)
+                return await think_gemini(augmented_prompt)
         else:
             # For non-heavy tasks, prioritize Gemini, then GLM-4, then Claude CLI.
             try:
-                return await think_gemini(prompt)
+                return await think_gemini(augmented_prompt)
             except Exception as e:
                 # If Gemini fails, try GLM-4.
                 log.error(f"Gemini failed for non-heavy task: {e}. Falling back to GLM-4.", exc_info=True)
                 try:
-                    text, brain = await think_glm(prompt)
+                    text, brain = await think_glm(augmented_prompt)
                     return (text, f"{brain} (fallback)")
                 except Exception as glm_error:
                     # If GLM-4 also fails, try Claude CLI.
                     log.error(f"GLM-4 also failed: {glm_error}. Falling back to Claude CLI.", exc_info=True)
                     try:
-                        text, brain = await think_claude(prompt)
+                        text, brain = await think_claude(augmented_prompt)
                         return (text, f"{brain} (fallback)")
                     except ClaudeSessionExpired:
                         log.error("Claude CLI session expired during fallback for non-heavy task.")
@@ -471,11 +478,11 @@ async def think(prompt: str, heavy: bool = False, bias_to_x_lp: bool = False) ->
         # If a general unexpected error occurred, try to use the most robust fallback (Claude CLI, then Gemini).
         try:
             log.warning("Attempting fallback to Claude CLI due to unexpected error.")
-            return await think_claude(prompt)
+            return await think_claude(augmented_prompt)
         except ClaudeSessionExpired:
             log.warning("Claude CLI session expired during general fallback, attempting Gemini.")
             try:
-                return await think_gemini(prompt)
+                return await think_gemini(augmented_prompt)
             except Exception as gemini_fallback_e:
                 log.error(f"Gemini fallback also failed: {gemini_fallback_e}", exc_info=True)
                 raise AIUnavailable(f"AI is unavailable. Unexpected error occurred and all fallback models failed: {e}") from gemini_fallback_e
