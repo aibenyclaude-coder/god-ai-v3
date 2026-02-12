@@ -354,75 +354,80 @@ async def polling_loop(client: httpx.AsyncClient, offset: int = 0):
             retry_delay = 5
 
             for update in data.get("result", []):
-                offset = update["update_id"] + 1
-                msg = update.get("message")
-                if not msg or not msg.get("text"):
-                    continue
-                if str(msg["chat"]["id"]) != BENY_CHAT_ID:
-                    continue
-                text = msg["text"]
-                log.info(f"Beny: {text[:100]}")
-                # P1割り込みシグナル発行（自己改善を中断させる）
-                signal_p1_interrupt()
-                conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "beny", "text": text})
-
-                # Handle reflective commands first
-                if text.strip() == "/reflect":
-                    if is_reflecting():
-                        await tg_send(client, "振り返り中です。しばらくお待ちください。")
-                    else:
-                        await tg_send(client, "振り返り開始...")
-                        executed, result = await reflection_cycle(client)
-                        if executed:
-                            summary = result[:1000] + "..." if len(result) > 1000 else result
-                            await tg_send(client, f"振り返り完了。\n\n{summary}")
-                            # 振り返り結果をシステムアクションとして記録
-                            record_system_action(conversations, f"振り返り完了: {summary[:200]}")
-                            save_conversations(conversations)
-                        else:
-                            await tg_send(client, "振り返り中のためスキップしました。")
-                    continue
-
-                # Attempt to handle general messages via AI
-                pending_message_id = None
                 try:
-                    pending = await tg_send(client, "...")
-                    if not pending:
+                    offset = update["update_id"] + 1
+                    msg = update.get("message")
+                    if not msg or not msg.get("text"):
                         continue
-                    pending_message_id = pending["message_id"]
+                    if str(msg["chat"]["id"]) != BENY_CHAT_ID:
+                        continue
+                    text = msg["text"]
+                    log.info(f"Beny: {text[:100]}")
+                    # P1割り込みシグナル発行（自己改善を中断させる）
+                    signal_p1_interrupt()
+                    conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "beny", "text": text})
 
-                    response = await handle_message(client, text)
-                except AIUnavailable as e:
-                    # Gemini 429 + Claude CLIセッション切れ → 特別な通知
-                    response = f"⚠️ {e}\n\nBeny、ターミナルで以下を実行:\n`/opt/homebrew/bin/claude setup-token`"
-                    log.error(f"AIUnavailable: {e}")
-                    record_system_action(conversations, f"AI停止: {e}")
-                except Exception as e:
-                    log.error(f"handle_message failed: {e}", exc_info=True)
-                    response = f"エラー: {e}"
-                    # エラーをシステムアクションとして記録
-                    record_system_action(conversations, f"エラー発生: {e}")
-                    # If an error occurred and we sent a placeholder message, edit it with the error
+                    # Handle reflective commands first
+                    if text.strip() == "/reflect":
+                        if is_reflecting():
+                            await tg_send(client, "振り返り中です。しばらくお待ちください。")
+                        else:
+                            await tg_send(client, "振り返り開始...")
+                            executed, result = await reflection_cycle(client)
+                            if executed:
+                                summary = result[:1000] + "..." if len(result) > 1000 else result
+                                await tg_send(client, f"振り返り完了。\n\n{summary}")
+                                # 振り返り結果をシステムアクションとして記録
+                                record_system_action(conversations, f"振り返り完了: {summary[:200]}")
+                                save_conversations(conversations)
+                            else:
+                                await tg_send(client, "振り返り中のためスキップしました。")
+                        continue
+
+                    # Attempt to handle general messages via AI
+                    pending_message_id = None
+                    try:
+                        pending = await tg_send(client, "...")
+                        if not pending:
+                            continue
+                        pending_message_id = pending["message_id"]
+
+                        response = await handle_message(client, text)
+                    except AIUnavailable as e:
+                        # Gemini 429 + Claude CLIセッション切れ → 特別な通知
+                        response = f"⚠️ {e}\n\nBeny、ターミナルで以下を実行:\n`/opt/homebrew/bin/claude setup-token`"
+                        log.error(f"AIUnavailable: {e}")
+                        record_system_action(conversations, f"AI停止: {e}")
+                    except Exception as e:
+                        log.error(f"handle_message failed: {e}", exc_info=True)
+                        response = f"エラー: {e}"
+                        # エラーをシステムアクションとして記録
+                        record_system_action(conversations, f"エラー発生: {e}")
+                        # If an error occurred and we sent a placeholder message, edit it with the error
+                        if pending_message_id:
+                            await tg_edit(client, pending_message_id, response)
+                        else: # If no placeholder was sent, send error as new message
+                            await tg_send(client, response)
+                        continue # Continue to the next update
+
                     if pending_message_id:
                         await tg_edit(client, pending_message_id, response)
-                    else: # If no placeholder was sent, send error as new message
-                        await tg_send(client, response)
-                    continue # Continue to the next update
 
-                if pending_message_id:
-                    await tg_edit(client, pending_message_id, response)
+                    conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "god", "text": response[:500]})
+                    # ツイート投稿成功をシステムアクションとして記録
+                    if "ツイート投稿完了" in response:
+                        record_system_action(conversations, f"ツイート投稿: {response}")
+                    # 自己改善成功をシステムアクションとして記録
+                    if "自己改善成功" in response:
+                        record_system_action(conversations, f"自己改善: {response[:200]}")
+                    save_conversations(conversations)
+                    state["conversations_today"] = state.get("conversations_today", 0) + 1
+                    state["status"] = "running"
+                    save_state(state)
+                except Exception as update_e:
+                    log.error(f"Error processing update {update.get('update_id')}: {update_e}", exc_info=True)
+                    append_journal(f"### {datetime.now().strftime('%H:%M')} アップデート処理エラー: {update_e}")
 
-                conversations.append({"time": datetime.now(timezone.utc).isoformat(), "from": "god", "text": response[:500]})
-                # ツイート投稿成功をシステムアクションとして記録
-                if "ツイート投稿完了" in response:
-                    record_system_action(conversations, f"ツイート投稿: {response}")
-                # 自己改善成功をシステムアクションとして記録
-                if "自己改善成功" in response:
-                    record_system_action(conversations, f"自己改善: {response[:200]}")
-                save_conversations(conversations)
-                state["conversations_today"] = state.get("conversations_today", 0) + 1
-                state["status"] = "running"
-                save_state(state)
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.HTTPStatusError) as e:
             log.error(f"Network/HTTP error during polling: {e}")
             error_count += 1
