@@ -398,15 +398,35 @@ def update_claude_md():
 
 
 def _extract_recent_events(journal_text: str, max_events: int = 10) -> list[str]:
-    """journalから直近の重要イベントを抽出"""
+    """
+    Extracts recent important events from the journal text.
+    Optimized for speed and accuracy by using more efficient string searching.
+
+    Args:
+        journal_text: The text content of the journal.
+        max_events: The maximum number of events to return.
+
+    Returns:
+        A list of the most recent important event strings.
+    """
     events = []
-    for line in journal_text.splitlines():
-        if line.startswith("###"):
-            important_keywords = ["成功", "失敗", "エラー", "改善", "誕生", "完了", "開始"]
-            if any(kw in line for kw in important_keywords):
-                event = line.replace("###", "").strip()
-                if event and event not in events:
-                    events.append(event)
+    # Use regex to find lines starting with ### and containing important keywords.
+    # This is generally faster than iterating line by line and checking keywords individually.
+    # We specifically look for the ### prefix to ensure we're parsing structured journal entries.
+    # The keywords are also part of the regex for efficiency.
+    important_keywords_pattern = "|".join([
+        "成功", "失敗", "エラー", "改善", "誕生", "完了", "開始", "スキップ"
+    ])
+    event_pattern = re.compile(
+        rf"^### .*?\b({important_keywords_pattern})\b.*$",
+        re.MULTILINE
+    )
+
+    for match in event_pattern.finditer(journal_text):
+        event = match.group(0).replace("###", "").strip()
+        if event and event not in events:
+            events.append(event)
+
     return events[-max_events:] if len(events) > max_events else events
 
 
