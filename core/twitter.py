@@ -247,49 +247,60 @@ async def generate_tweet(client) -> str:
 
 
 async def auto_tweet(client) -> bool:
-    """ツイートを自動生成→重複チェック→投稿→journal記録。
+    """Tweet generation -> duplicate check -> posting -> journal recording.
 
     Args:
-        client: httpx.AsyncClient (Telegram送信用)
+        client: httpx.AsyncClient (for Telegram sending)
 
     Returns:
-        投稿成功ならTrue
+        True if posting was successful.
     """
     from god import tg_send
     from memory import load_conversations, save_conversations, append_journal
 
     if not is_configured():
-        log.info("auto_tweet: Twitter未設定、スキップ")
+        log.info("auto_tweet: Twitter not configured, skipping.")
         return False
 
     tweet_text = await generate_tweet(client)
     if not tweet_text:
         return False
 
-    # 重複チェック（generate_tweetで履歴参照済みだが、最終確認）
-    history = get_tweet_history()
-    if tweet_text in history:
-        log.warning("auto_tweet: 生成テキストが履歴と重複、スキップ")
+    # Duplicate check (already checked in generate_tweet, but final confirmation)
+    tweet_history = get_tweet_history()
+    if tweet_text in tweet_history:
+        log.warning("auto_tweet: Generated tweet is a duplicate, skipping.")
         return False
 
-    result = post_tweet(tweet_text)
-    if result["success"]:
-        log.info(f"auto_tweet: 投稿成功 {result['url']}")
-        await tg_send(client, f"[自動ツイート投稿]\n{tweet_text}\n{result['url']}")
-        try:
-            conversations = load_conversations()
-            conversations.append({
-                "time": datetime.now(timezone.utc).isoformat(),
-                "from": "system",
-                "text": f"自動ツイート: {tweet_text[:100]}"
-            })
-            save_conversations(conversations)
-        except Exception as e:
-            log.warning(f"auto_tweet: 会話記録失敗: {e}")
-        return True
-    else:
-        log.error(f"auto_tweet: 投稿失敗 {result['error']}")
-        return False
+    # Retry mechanism for posting tweets
+    max_retries = 3
+    last_error = None
+    for attempt in range(max_retries):
+        result = post_tweet(tweet_text)
+        if result["success"]:
+            log.info(f"auto_tweet: Successfully posted {result['url']}")
+            await tg_send(client, f"[Auto-tweet Posted]\n{tweet_text}\n{result['url']}")
+            try:
+                conversations = load_conversations()
+                conversations.append({
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "from": "system",
+                    "text": f"Auto-tweet: {tweet_text[:100]}"
+                })
+                save_conversations(conversations)
+            except Exception as e:
+                log.warning(f"auto_tweet: Failed to save conversation history: {e}")
+            return True
+        else:
+            last_error = result["error"]
+            log.warning(f"auto_tweet: Post attempt {attempt+1}/{max_retries} failed: {last_error}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff
+                log.info(f"auto_tweet: Retrying in {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+
+    log.error(f"auto_tweet: Posting failed after {max_retries} attempts. Last error: {last_error}")
+    return False
 
 
 async def tweet_scheduler_loop(client):
