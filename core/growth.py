@@ -414,16 +414,20 @@ def _extract_recent_events(journal_text: str, max_events: int = 10) -> list[str]
     # This is generally faster than iterating line by line and checking keywords individually.
     # We specifically look for the ### prefix to ensure we're parsing structured journal entries.
     # The keywords are also part of the regex for efficiency.
+    # Added more specific keywords and patterns to capture events more accurately.
+    # Ensured that lines are captured as whole events.
     important_keywords_pattern = "|".join([
-        "成功", "失敗", "エラー", "改善", "誕生", "完了", "開始", "スキップ"
+        "成功", "失敗", "エラー", "改善", "誕生", "完了", "開始", "スキップ", "ロールバック", "テスト合格", "テスト失敗", "構文エラー"
     ])
+    # The pattern now specifically looks for a line starting with ### and containing the important keywords.
+    # It captures the entire line after ###.
     event_pattern = re.compile(
-        rf"^### .*?\b({important_keywords_pattern})\b.*$",
+        rf"^###\s+(.*?{important_keywords_pattern}.*?)$",
         re.MULTILINE
     )
 
     for match in event_pattern.finditer(journal_text):
-        event = match.group(0).replace("###", "").strip()
+        event = match.group(1).strip() # Capture group 1, which is the content after ###
         if event and event not in events:
             events.append(event)
 
