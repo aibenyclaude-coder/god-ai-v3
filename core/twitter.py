@@ -248,6 +248,7 @@ async def generate_tweet(client) -> str:
 
 async def auto_tweet(client) -> bool:
     """Tweet generation -> duplicate check -> posting -> journal recording.
+    Includes a check for minimum engagement metrics before posting.
 
     Args:
         client: httpx.AsyncClient (for Telegram sending)
@@ -262,14 +263,32 @@ async def auto_tweet(client) -> bool:
         log.info("auto_tweet: Twitter not configured, skipping.")
         return False
 
+    # Fetch engagement metrics and check threshold
+    engagement_threshold = 5  # Configurable threshold: minimum average likes+retweets+replies
+    tweet_history_with_metrics = get_tweet_history_with_metrics() # Assumes this function returns tweets with engagement data
+    
+    if tweet_history_with_metrics:
+        recent_tweets = tweet_history_with_metrics[-10:] # Look at the last 10 tweets for average engagement
+        if recent_tweets:
+            total_engagement = sum(t.get('likes', 0) + t.get('retweets', 0) + t.get('replies', 0) for t in recent_tweets)
+            average_engagement = total_engagement / len(recent_tweets)
+
+            if average_engagement < engagement_threshold:
+                log.info(f"auto_tweet: Average engagement ({average_engagement:.2f}) is below threshold ({engagement_threshold}). Skipping tweet.")
+                return False
+        else:
+            log.info("auto_tweet: No recent tweet metrics available, proceeding with tweet generation.")
+    else:
+        log.info("auto_tweet: No tweet history with metrics, proceeding with tweet generation.")
+
     tweet_text = await generate_tweet(client)
     if not tweet_text or not tweet_text.strip():
         log.warning("auto_tweet: Generated tweet text is empty or whitespace, skipping.")
         return False
 
     # Duplicate check (already checked in generate_tweet, but final confirmation)
-    tweet_history = get_tweet_history()
-    if tweet_text in tweet_history:
+    tweet_history_texts = get_tweet_history()
+    if tweet_text in tweet_history_texts:
         log.warning("auto_tweet: Generated tweet is a duplicate, skipping.")
         return False
 
@@ -302,6 +321,31 @@ async def auto_tweet(client) -> bool:
 
     log.error(f"auto_tweet: Posting failed after {max_retries} attempts. Last error: {last_error}")
     return False
+
+
+# Helper function to get tweet history with engagement metrics.
+# This function needs to be implemented to fetch and store engagement data.
+# For now, it returns an empty list if not implemented.
+def get_tweet_history_with_metrics() -> list[dict]:
+    """
+    Retrieves tweet history including engagement metrics (likes, retweets, replies).
+    This is a placeholder and needs to be implemented to fetch actual metrics.
+    Example return: [{"text": "...", "likes": 10, "retweets": 5, "replies": 2, "timestamp": "..."}, ...]
+    """
+    try:
+        if not STATE_PATH.exists():
+            return []
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        history = state.get("tweet_history_with_metrics", [])
+        return history if isinstance(history, list) else []
+    except Exception as e:
+        log.warning(f"tweet_history_with_metrics読み込み失敗: {e}")
+        return []
+
+# NOTE: The `add_to_tweet_history` function should ideally be modified to also store engagement metrics
+# when a tweet is successfully posted. This would involve fetching these metrics from the Twitter API
+# after posting and updating the state. For this specific improvement, we are focusing on the
+# `auto_tweet` function and assuming `get_tweet_history_with_metrics` can provide the data.
 
 
 async def tweet_scheduler_loop(client):
