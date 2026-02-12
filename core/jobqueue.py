@@ -388,6 +388,7 @@ def get_next_queued_job() -> dict | None:
     being processed by another 'running' job.
     Includes error handling for robust queue processing.
     If a job has been queued for an excessive amount of time, it is flagged.
+    The returned job object will include an 'age' field in seconds.
     """
     LONG_QUEUE_THRESHOLD_SECONDS = 7200  # 2 hours
 
@@ -427,18 +428,19 @@ def get_next_queued_job() -> dict | None:
         if target_file and target_file in running_targets:
             continue
 
-        # Long Queue Check: Flag jobs that have been queued for too long
+        # Calculate job age and flag if it's excessively long
+        job_age_seconds = 0
         if job.get("meta", {}).get("created_at"):
             try:
                 created_at = datetime.fromisoformat(job["meta"]["created_at"])
-                queue_duration = (now - created_at).total_seconds()
-                if queue_duration > LONG_QUEUE_THRESHOLD_SECONDS:
+                job_age_seconds = (now - created_at).total_seconds()
+                job["age"] = job_age_seconds  # Add age to the job object
+
+                if job_age_seconds > LONG_QUEUE_THRESHOLD_SECONDS:
                     log.warning(
                         f"Job {job.get('task_id', 'N/A')} has been queued for "
-                        f"{queue_duration:.0f} seconds, exceeding the threshold."
+                        f"{job_age_seconds:.0f} seconds, exceeding the threshold."
                     )
-                    # Optionally, you could modify the job status here or add a flag
-                    # For now, we just log it and proceed to return it if it's the highest priority.
             except Exception as e:
                 log.error(f"Error calculating queue duration for job {job.get('task_id', 'N/A')}: {e}")
 
@@ -447,11 +449,12 @@ def get_next_queued_job() -> dict | None:
     if not eligible_jobs:
         return None
 
-    # Sort eligible jobs by priority (P1 > P2 > P3) and then by creation time
+    # Sort eligible jobs by priority (P1 > P2 > P3) and then by age (older first)
     try:
         eligible_jobs.sort(
             key=lambda j: (
                 PRIORITY_ORDER.get(j.get("priority", "P3"), 9),
+                -j.get("age", 0),  # Sort by age descending (older first)
                 j.get("meta", {}).get("created_at", ""),
             )
         )
@@ -459,7 +462,7 @@ def get_next_queued_job() -> dict | None:
         log.error(f"Error sorting eligible jobs: {e}", exc_info=True)
         return None
 
-    # Return the highest priority job
+    # Return the highest priority and oldest job
     return eligible_jobs[0]
 
 
