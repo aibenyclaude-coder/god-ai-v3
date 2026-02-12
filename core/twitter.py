@@ -80,6 +80,15 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
                      "TWITTER_ACCESS_TOKEN_SECRET"
         }
 
+    # --- Improvement: Check for duplicate tweets ---
+    # In a real scenario, tweet_history would be loaded from a persistent storage
+    # For demonstration, assuming tweet_history is accessible and contains tweet texts
+    # This is a placeholder for actual history retrieval logic
+    tweet_history = get_tweet_history()  # Assume this function exists and returns a list of strings
+    if text in tweet_history:
+        return {"success": False, "error": "Duplicate tweet detected. This tweet has already been posted."}
+    # --- End Improvement ---
+
     # Append call-to-action with Coconala link if not already present and if it seems like a service offering
     coconala_url = "https://coconala.com/services/4072452"
     cta_suffix = f"\n\nLP made by AI: {coconala_url}"
@@ -128,6 +137,9 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
             try:
                 response = client.create_tweet(text=text, media_ids=media_ids)
                 tweet_id = response.data["id"]
+                # --- Improvement: Add newly posted tweet to history ---
+                add_to_tweet_history(text) # Assume this function exists to save the new tweet
+                # --- End Improvement ---
                 return {
                     "success": True,
                     "tweet_id": tweet_id,
@@ -163,6 +175,29 @@ def post_tweet(text: str, media: list[str] | None = None) -> dict:
         return {"success": False, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": f"Tweet post error: {e}"}
+
+
+# Placeholder functions for tweet history management.
+# These would need to be implemented based on the actual storage mechanism.
+def get_tweet_history() -> list[str]:
+    """
+    Retrieves the history of posted tweet texts.
+    This is a placeholder and should be replaced with actual data loading logic.
+    """
+    # Example: Load from a file or database
+    # For now, return an empty list.
+    # In a real implementation, this would load from a persistent store.
+    return []
+
+def add_to_tweet_history(text: str):
+    """
+    Adds a new tweet text to the history.
+    This is a placeholder and should be replaced with actual data saving logic.
+    """
+    # Example: Save to a file or database
+    # For now, do nothing.
+    # In a real implementation, this would save to a persistent store.
+    pass
 
 
 def get_setup_instructions() -> str:
