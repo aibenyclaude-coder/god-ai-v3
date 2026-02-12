@@ -45,17 +45,20 @@ def get_client():
     return client
 
 
-def post_tweet(text: str) -> dict:
+def post_tweet(text: str, media: list[str] | None = None) -> dict:
     """
     Post a tweet with an appended call-to-action linking to the Coconala service page.
+    Optionally upload media (images).
 
     Args:
         text: Tweet body (280 chars recommended limit)
+        media: A list of file paths to images to be uploaded with the tweet.
 
     Returns:
         dict: Post result
             - success: bool
             - tweet_id: str (on success)
+            - url: str (on success)
             - error: str (on failure)
     """
     if not text or not text.strip():
@@ -73,15 +76,27 @@ def post_tweet(text: str) -> dict:
 
     # Append call-to-action with Coconala link if not already present
     coconala_url = "https://coconala.com/services/4072452"
-    if coconala_url not in text:
-        cta_suffix = f"\n\nLP made by AI: {coconala_url}"
-        # Respect Twitter's 280 char limit
-        if len(text) + len(cta_suffix) <= 280:
-            text = text.rstrip() + cta_suffix
+    cta_suffix = f"\n\nLP made by AI: {coconala_url}"
+    
+    # Check if adding CTA exceeds the limit only if no media is present or if it's short
+    if len(text) + len(cta_suffix) > 280 and (not media or len(text) <= 280 - len(cta_suffix)):
+        # If text is already long, and we have media, we might not be able to add CTA.
+        # Prioritize posting the content and media.
+        pass 
+    elif coconala_url not in text:
+        text = text.rstrip() + cta_suffix
 
     try:
         client = get_client()
-        response = client.create_tweet(text=text)
+        
+        # Handle media upload if provided
+        media_ids = None
+        if media:
+            media_upload_response = client.upload_media(media, media_category="tweet_image")
+            media_ids = media_upload_response.data["media_id"]
+
+        response = client.create_tweet(text=text, media_ids=media_ids)
+        
         tweet_id = response.data["id"]
         return {
             "success": True,
