@@ -280,23 +280,21 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
     loop = asyncio.get_running_loop()
     original_prompt = prompt
 
-    # 段階的タイムアウト設定
-    # タイムアウト値を徐々に長くし、リトライ間隔も設定
+    # Incremental timeout settings and retry intervals.
     timeouts = [60, 90, 120]
     sleep_between_retries = 5
 
     for attempt in range(3):
         current_timeout = timeouts[attempt]
 
-        # 2回目以降はプロンプトを短縮してリトライ
-        # プロンプトが長すぎるとタイムアウトしやすいため
+        # Shorten prompt on subsequent attempts to reduce chances of timeout.
         current_prompt = original_prompt
         if attempt >= 1 and len(original_prompt) > 1000:
-            # プロンプトを最後の1000文字に短縮
-            current_prompt = "...(省略)...\n" + original_prompt[-1000:]
-            log.warning(f"Claude CLI attempt {attempt+1}: プロンプトを短縮 ({len(original_prompt)} -> {len(current_prompt)}文字)")
+            current_prompt = "...(truncated)...\n" + original_prompt[-1000:]
+            log.warning(f"Claude CLI attempt {attempt+1}: Prompt truncated ({len(original_prompt)} -> {len(current_prompt)} chars)")
 
         try:
+            # Execute Claude CLI command in a separate thread to avoid blocking the event loop.
             result = await loop.run_in_executor(
                 None,
                 lambda p=current_prompt, t=current_timeout: subprocess.run(
@@ -305,21 +303,21 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                     env=CLI_ENV,
                 ),
             )
-            # stderrがあればログ記録（原因特定用）
+            # Log stderr if present, for debugging.
             if result.stderr and result.stderr.strip():
                 log.error(f"Claude CLI stderr (attempt {attempt+1}): {result.stderr[:500]}")
 
+            # Check for successful execution and non-empty stdout.
             if result.returncode == 0 and result.stdout.strip():
                 _claude_count += 1
                 await _save_brain_counts(_gemini_count, _glm_count, _claude_count)
                 log.info("Claude CLI success.")
                 return (result.stdout.strip(), "Claude CLI")
 
-            # "Not logged in" チェック（即座に例外、リトライ不要）
             stdout_full = result.stdout if result.stdout else "(empty)"
+            # Detect session expiration.
             if "Not logged in" in stdout_full:
-                log.error("Claude CLI: セッション切れ。再ログインが必要 (claude setup-token)")
-                # Attempt to re-authenticate
+                log.error("Claude CLI: Session expired. Re-login required (claude setup-token).")
                 setup_success = False
                 try:
                     log.info("Attempting to run 'claude setup-token' to re-authenticate.")
@@ -342,15 +340,14 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                     log.error(f"An error occurred during Claude CLI setup-token: {e}")
 
                 if setup_success:
-                    # Retry the original prompt after successful setup
+                    # Retry the original prompt after successful setup.
                     log.info("Retrying Claude CLI with original prompt after successful setup-token.")
-                    # This will restart the loop to the first attempt with the original prompt.
-                    continue # This will break out of the current attempt's inner try block and restart the for loop
+                    continue # Restarts the for loop for the next attempt.
                 else:
                     # If setup failed, raise ClaudeSessionExpired to trigger fallback.
                     raise ClaudeSessionExpired("Claude CLI session expired and setup-token failed or timed out.")
 
-            # 詳細なエラーログ（stdout/stderr両方、プロンプト長も）
+            # Log detailed error information for debugging.
             stderr_full = result.stderr if result.stderr else "(empty)"
             log.error(f"Claude CLI attempt {attempt+1}: returncode={result.returncode}, prompt_len={len(current_prompt)}, timeout={current_timeout}s")
             log.error(f"  stdout: {stdout_full[:500]}")
@@ -358,24 +355,22 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
 
         except subprocess.TimeoutExpired:
             log.error(f"Claude CLI attempt {attempt+1}: timeout ({current_timeout}s)")
-            # 3回目のタイムアウトはGeminiにフォールバック
+            # On the 3rd timeout, fallback to Gemini.
             if attempt == 2:
-                log.warning("Claude CLI 3回タイムアウト、Geminiにフォールバック")
-                # Geminiへのフォールバック時は、元のプロンプトの末尾を使用
+                log.warning("Claude CLI 3 timeouts, falling back to Gemini.")
+                # Use a truncated prompt for Gemini fallback if original is too long.
                 fallback_prompt = original_prompt[-2000:] if len(original_prompt) > 2000 else original_prompt
                 try:
                     text, brain = await think_gemini(fallback_prompt)
                     log.info(f"Gemini fallback success from Claude CLI timeout.")
                     return (text, f"{brain} (Claude fallback)")
                 except Exception as e:
-                    log.error(f"Gemini fallback failed: {e}")
-                    # If Gemini also fails, raise AIUnavailable to indicate complete failure
+                    log.error(f"Gemini fallback failed: {e}", exc_info=True)
                     raise AIUnavailable(f"Claude CLI timed out and Gemini fallback failed: {e}") from e
         except ClaudeSessionExpired as e:
             log.error(f"Claude CLI session expired (attempt {attempt+1}): {e}")
-            # If ClaudeSessionExpired is caught here (and not from the "Not logged in" check),
-            # attempt setup-token and retry. If it fails, this exception will propagate to the next level.
-            if attempt < 2: # Only retry setup if not the last attempt
+            # Attempt to re-authenticate if it's not the last attempt.
+            if attempt < 2:
                 setup_success = False
                 try:
                     log.info("Attempting to run 'claude setup-token' to re-authenticate after session expired.")
@@ -399,36 +394,34 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
 
                 if setup_success:
                     log.info("Retrying Claude CLI with original prompt after successful setup-token.")
-                    continue # Restart the loop for the next attempt
+                    continue # Restarts the for loop for the next attempt.
                 else:
                     log.error("Claude CLI setup-token failed. Falling back to Gemini.")
-                    # If setup fails, directly trigger fallback to Gemini.
                     try:
                         text, brain = await think_gemini(original_prompt) # Use original prompt for Gemini fallback
                         return (text, f"{brain} (Claude fallback)")
                     except Exception as gemini_fallback_e:
-                        log.error(f"Gemini fallback failed: {gemini_fallback_e}")
+                        log.error(f"Gemini fallback failed: {gemini_fallback_e}", exc_info=True)
                         raise AIUnavailable(f"Claude CLI session expired and setup failed. Gemini fallback also failed: {gemini_fallback_e}") from gemini_fallback_e
             else:
-                # If this is the last attempt and ClaudeSessionExpired, fallback to Gemini
+                # If it's the last attempt and ClaudeSessionExpired, fallback to Gemini.
                 log.warning("Claude CLI session expired on last attempt, falling back to Gemini.")
                 try:
                     text, brain = await think_gemini(original_prompt)
                     return (text, f"{brain} (Claude fallback)")
                 except Exception as e:
-                    log.error(f"Gemini fallback failed: {e}")
+                    log.error(f"Gemini fallback failed: {e}", exc_info=True)
                     raise AIUnavailable(f"Claude CLI session expired and last attempt failed. Gemini fallback also failed: {e}") from e
 
         except Exception as e:
             log.error(f"Claude CLI attempt {attempt+1}: {e}")
 
-        # リトライ間隔を空ける
+        # Wait before the next retry.
         if attempt < 2:
             await asyncio.sleep(sleep_between_retries)
 
-    # 全ての試行で失敗した場合
+    # If all attempts fail, raise AIUnavailable.
     log.error("Claude CLI failed after all attempts.")
-    # If Claude CLI fails consistently, raise AIUnavailable
     raise AIUnavailable(f"Claude CLI failed after 3 attempts (timeouts={timeouts}s).")
 
 # --- 統合思考関数 ---
