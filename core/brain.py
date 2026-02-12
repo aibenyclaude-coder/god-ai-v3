@@ -340,7 +340,8 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
                     return (text, f"{brain} (Claude fallback)")
                 except Exception as e:
                     log.error(f"Gemini fallback failed: {e}")
-                    raise RuntimeError(f"Claude CLI and Gemini both failed after timeout: {e}")
+                    # If Gemini also fails, raise AIUnavailable to indicate complete failure
+                    raise AIUnavailable(f"Claude CLI timed out and Gemini fallback failed: {e}") from e
         except Exception as e:
             log.error(f"Claude CLI attempt {attempt+1}: {e}")
 
@@ -350,7 +351,8 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
 
     # 全ての試行で失敗した場合
     log.error("Claude CLI failed after all attempts.")
-    raise RuntimeError(f"Claude CLI failed after 3 attempts (timeouts={timeouts}s)")
+    # If Claude CLI fails consistently, raise AIUnavailable
+    raise AIUnavailable(f"Claude CLI failed after 3 attempts (timeouts={timeouts}s).")
 
 # --- 統合思考関数 ---
 async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
