@@ -70,6 +70,25 @@ def _detect_invalid_module_names(text: str) -> list[str]:
             invalid.append(f)
     return list(set(invalid))  # 重複除去
 
+def _extract_function_signatures(filepath) -> str:
+    """ファイルの全関数の「def文 + 先頭3行」を抽出して文字列で返す"""
+    try:
+        code = filepath.read_text(encoding="utf-8")
+        lines = code.splitlines()
+        tree = ast.parse(code)
+    except Exception:
+        return "(parse error)"
+
+    sigs = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start = node.lineno - 1  # 0-indexed
+            end = min(start + 4, len(lines))  # def line + 3 body lines
+            snippet = "\n".join(lines[start:end])
+            sigs.append(snippet)
+    return "\n\n".join(sigs) if sigs else "(no functions)"
+
+
 def _detect_read_files(target_path, target_name: str) -> list[str]:
     """対象ファイルのimport文を解析し、同プロジェクト内の依存ファイルパスを返す。"""
     import re as _re
@@ -1152,16 +1171,16 @@ async def _drive_backup_silent():
         log.debug(f"Drive自動バックアップスキップ: {e}")
 
 # --- 振り返りサイクル ---
-async def reflection_cycle(client: httpx.AsyncClient) -> str:
-    """振り返り実行。戻り値: 振り返り結果のテキスト"""
+async def reflection_cycle(client: httpx.AsyncClient) -> tuple[bool, str]:
+    """振り返り実行。戻り値: (実行したかどうか, 振り返り結果テキスト)"""
     global _reflecting
     if _reflecting:
         log.warning("振り返り中のため新しい振り返り要求を無視")
-        return ""
+        return (False, "")
     _reflecting = True
     try:
         result = await _reflection_cycle_inner(client)
-        return result
+        return (True, result)
     finally:
         _reflecting = False
 
@@ -1201,36 +1220,22 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient) -> str:
     least_improved = sorted(modules_improved.items(), key=lambda x: x[1])
     least_improved_list = ", ".join([f"{name}({count}回)" for name, count in least_improved[:3]])
 
-    # 過去のジャーナルから「未完了」タスクを抽出
-    uncompleted_tasks = []
-    current_task_info = state.get("current_task")
-    if current_task_info is None:
-        log.info("current_taskがnullです。過去のジャーナルから未完了タスクを検索します。")
-        for line in reversed(journal_tail.splitlines()):
-            if line.startswith("###"): # エントリの開始
-                task_match = re.search(r'未完了タスク:\s*([\w\s\-_.]+)(.*)', line)
-                if task_match:
-                    task_name = task_match.group(1).strip()
-                    # task_nameが既にstate.jsonに保存されているタスクと重複しないか確認
-                    existing_task_found = False
-                    if "tasks" in state:
-                        for existing_task in state["tasks"]:
-                            if existing_task.get("name") == task_name:
-                                existing_task_found = True
-                                break
-                    if not existing_task_found and task_name not in uncompleted_tasks:
-                        uncompleted_tasks.append(task_name)
-                        log.debug(f"ジャーナルから未完了タスク検出: {task_name}")
-                        if len(uncompleted_tasks) >= 5: # 5つまでで打ち切り
-                            break
-    
-    # 未完了タスクを優先度順（仮）に並べ替えてcurrent_taskに設定
-    if current_task_info is None and uncompleted_tasks:
-        # ここでは単純に検出順に設定するが、将来的に優先度付けロジックを導入する
-        state["current_task"] = {"name": uncompleted_tasks[0], "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
-        log.info(f"current_taskを過去の未完了タスク '{uncompleted_tasks[0]}' に設定しました。")
-        # stateを保存
-        await safe_save_state(state)
+    # 各モジュールの関数一覧を抽出
+    module_func_lines = []
+    for mod_name, mod_path in MODULE_PATHS.items():
+        if mod_path.exists():
+            try:
+                mod_code = mod_path.read_text(encoding="utf-8")
+                tree = ast.parse(mod_code)
+                func_names = [
+                    node.name for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ]
+                if func_names:
+                    module_func_lines.append(f"{mod_name}.py: {', '.join(func_names)}")
+            except Exception:
+                pass
+    module_func_text = "\n".join(module_func_lines) if module_func_lines else "(抽出失敗)"
 
     prompt = f"""あなたはGod AI。自律型AIとして振り返りを行え。
 
@@ -1242,6 +1247,12 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient) -> str:
 
 【対象モジュール一覧】（これ以外のファイル名を提案するな）
 {valid_module_list}
+
+【各モジュールの関数一覧】
+{module_func_text}
+
+CODE_IMPROVEMENTで関数名を指定する場合は、上の一覧にある関数名だけ使え。
+存在しない関数名（run_self_growth, analyze_error, process_job, save_error_context等）を書くな。
 
 【キューに既にあるジョブ】
 {queued_info}
@@ -1263,157 +1274,7 @@ async def _reflection_cycle_inner(client: httpx.AsyncClient) -> str:
 コードの改善点がある場合は「CODE_IMPROVEMENT:」で始まる行に具体的な修正内容を書け。
 【重要ルール】
 - 存在しないファイル（self_growth.py等）を提案してはならない
-- 既にキューにある改善と同じものを提案するな。別の改善を提案しろ
-- 直近3回で失敗した改善と同じものは提案するな
-- 改善対象のファイルを分散させろ（改善回数が少ないモジュールを優先）
-- 1つのCODE_IMPROVEMENTで1つのファイルの1つの関数だけを対象にしろ"""
-
-    try:
-        reflection, brain_name = await think_gemini(prompt)
-    except Exception as e:
-        log.error(f"Reflection failed: {e}")
-        error_msg = f"振り返り失敗: {e}"
-        await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} {error_msg}")
-        return error_msg
-
-    # journalに追記
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    await safe_append_journal(f"### {now} 振り返り (brain: {brain_name})\n{reflection}")
-
-    # state更新
-    state["growth_cycles"] = state.get("growth_cycles", 0) + 1
-    state["last_reflection"] = now
-    await safe_save_state(state)
-
-    # Google Driveバックアップ
-    await _drive_backup_silent()
-
-    # コード改善提案チェック
-    if "CODE_IMPROVEMENT:" in reflection:
-        improvements = []
-        for line in reflection.splitlines():
-            cleaned = line.strip().lstrip('*- ').strip()
-            if cleaned.startswith("CODE_IMPROVEMENT:"):
-                improvements.append(cleaned.replace("CODE_IMPROVEMENT:", "").strip())
-
-        if improvements:
-            improvement_text = "\n".join(improvements)
-
-            # 無効なファイル名チェック（存在しないモジュールを提案していないか）
-            invalid_files = _detect_invalid_module_names(improvement_text)
-            if invalid_files:
-                log.warning(f"無効なファイル名を検出: {invalid_files}")
-                skip_msg = f"### {now} 自己改善スキップ（無効なファイル名）\n無効: {invalid_files}\n提案: {improvement_text[:200]}"
-                await safe_append_journal(skip_msg)
-                await tg_send(client, f"自己改善スキップ: 存在しないファイル名を検出 ({', '.join(invalid_files)})")
-                return reflection
-
-            # status-based 重複チェック（successとskippedのみスキップ）
-            is_dup, dup_reason = is_duplicate_improvement(improvement_text)
-            if is_dup:
-                log.info(f"重複チェック: {dup_reason}")
-                update_growth_stats(success=False, failure_reason="duplicate", module="unknown", duration=0)
-                skip_msg = f"### {now} 自己改善スキップ（{dup_reason}）\n改善内容: {improvement_text}"
-                await safe_append_journal(skip_msg)
-                await tg_send(client, f"自己改善スキップ: {dup_reason}\n提案: {improvement_text[:200]}")
-            else:
-                # 提案段階で "proposed" を記録（まだ実行前）
-                record_improvement(improvement_text, "proposed")
-                log.info(f"改善提案を記録 (status=proposed): {improvement_text[:50]}")
-                # ジョブキューにself_improveジョブを登録
-                result = select_target_module(improvement_text)
-                if result:
-                    target_path, target_name = result
-                    # 依存ファイル自動推定（対象ファイルのimport文を解析）
-                    dep_files = _detect_read_files(target_path, target_name)
-                    new_job = create_job(
-                        job_type="self_improve",
-                        priority="P3",
-                        target_file=f"core/{target_name}.py",
-                        read_files=dep_files,
-                        instruction=improvement_text,
-                        constraints=["構文チェック必須", "テスト必須"],
-                        estimated_seconds=120,
-                    )
-                    if new_job:
-                        log.info(f"自己改善ジョブ作成: {target_name}.py")
-                        await tg_send(client, f"自己改善ジョブ登録: {target_name}.py\n改善: {improvement_text[:100]}")
-                    else:
-                        log.info(f"自己改善ジョブ重複スキップ: {target_name}.py")
-
-    # CLAUDE.md自動更新
-    update_claude_md()
-
-    log.info("振り返りサイクル完了")
-    return reflection
-
-async def _reflection_cycle_inner(client: httpx.AsyncClient) -> str:
-    """振り返り実行の内部処理。戻り値: 振り返り結果のテキスト"""
-    from god import tg_send
-    log.info("振り返りサイクル開始")
-    state = load_state()
-    journal_tail = read_file(JOURNAL_PATH, tail=50)
-
-    # journalを圧縮してプロンプトサイズを削減
-    journal_compressed = compress_journal_for_reflection(journal_tail, max_chars=2500)
-
-    # 有効なモジュール一覧を生成
-    valid_module_list = ", ".join([f"{name}.py" for name in VALID_MODULES])
-
-    # キュー情報と失敗ジョブ情報を収集
-    queued_jobs = get_queued_job_summaries()
-    queued_info = "(なし)"
-    if queued_jobs:
-        queued_lines = []
-        for qj in queued_jobs:
-            queued_lines.append(f"- [{qj['status']}] {qj['target_file']}: {qj['instruction']}")
-        queued_info = "\n".join(queued_lines)
-
-    failed_jobs = get_recent_failed_jobs(limit=3)
-    failed_info = "(なし)"
-    if failed_jobs:
-        failed_lines = []
-        for fj in failed_jobs:
-            failed_lines.append(f"- {fj['target_file']}: {fj['instruction']} (エラー: {fj['error']})")
-        failed_info = "\n".join(failed_lines)
-
-    # 改善対象のファイル分散のために、最近改善されたモジュールを取得
-    stats = load_growth_stats()
-    modules_improved = stats.get("modules_improved", {})
-    least_improved = sorted(modules_improved.items(), key=lambda x: x[1])
-    least_improved_list = ", ".join([f"{name}({count}回)" for name, count in least_improved[:3]])
-
-    prompt = f"""あなたはGod AI。自律型AIとして振り返りを行え。
-
-【現在の状態】
-{json.dumps(state, ensure_ascii=False)}
-
-【最近のjournal】
-{journal_compressed}
-
-【対象モジュール一覧】（これ以外のファイル名を提案するな）
-{valid_module_list}
-
-【キューに既にあるジョブ】
-{queued_info}
-
-【直近3回の失敗ジョブ】
-{failed_info}
-
-【改善回数が少ないモジュール】
-{least_improved_list}
-
-【タスク】
-以下の4つに答えろ：
-1. 今日何をした？
-2. 何が問題だった？
-3. 次に何をすべき？
-4. 自分のコードに改善点はあるか？（具体的に、上記モジュール一覧のファイルのみ対象）
-
-簡潔に日本語で答えろ。
-コードの改善点がある場合は「CODE_IMPROVEMENT:」で始まる行に具体的な修正内容を書け。
-【重要ルール】
-- 存在しないファイル（self_growth.py等）を提案してはならない
+- 存在しない関数名を提案してはならない。上の関数一覧にある名前だけ使え
 - 既にキューにある改善と同じものを提案するな。別の改善を提案しろ
 - 直近3回で失敗した改善と同じものは提案するな
 - 改善対象のファイルを分散させろ（改善回数が少ないモジュールを優先）
@@ -1538,6 +1399,30 @@ async def self_growth_scheduler(client: httpx.AsyncClient):
     log.info(f"連続自己成長スケジューラ開始 (サイクル間隔: {GROWTH_CYCLE_SLEEP}秒)")
     await asyncio.sleep(30)  # 起動後30秒待ってから開始
 
+    # 実行しようとする関数名のリスト（reflection_cycle, create_job, select_target_moduleなど）
+    # これらの関数が growth.py 内に存在することを保証する
+    # 実際には、importlib.util.find_spec または globals() を使って動的にチェックするのがより堅牢
+    # ここでは、既知の関数名をリストアップして、存在しない場合のエラーを検出する
+    # 以下のリストは、self_growth_scheduler が直接・間接的に呼び出す可能性のある関数
+    known_growth_functions = [
+        "reflection_cycle",
+        "create_job",
+        "select_target_module",
+        "record_improvement",
+        "is_duplicate_improvement",
+        "update_growth_stats",
+        "safe_append_journal",
+        "get_queued_job_summaries",
+        "get_recent_failed_jobs",
+        "think_gemini", # brain.py から呼ばれるが、growth.py からの呼び出しとみなす
+        "load_state", # memory.py から呼ばれるが、growth.py からの呼び出しとみなす
+        "safe_save_state", # memory.py から呼ばれるが、growth.py からの呼び出しとみなす
+        "load_growth_stats",
+        "update_claude_md",
+        "_detect_invalid_module_names",
+        "_detect_read_files",
+    ]
+
     while True:
         try:
             # P1割り込みチェック
@@ -1548,6 +1433,14 @@ async def self_growth_scheduler(client: httpx.AsyncClient):
                 continue
 
             # 振り返り実行（結果からCODE_IMPROVEMENTを検出→ジョブ作成は_reflection_cycle_inner内）
+            # reflection_cycle 関数が存在するかチェック
+            if "reflection_cycle" not in globals() or not callable(reflection_cycle):
+                error_msg = "reflection_cycle 関数が見つかりません。growth.py のロードに失敗した可能性があります。"
+                log.error(error_msg)
+                await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} 緊急エラー\n{error_msg}")
+                await asyncio.sleep(GROWTH_CYCLE_SLEEP * 2) # 長めに待機
+                continue
+
             executed, result = await reflection_cycle(client)
             if executed:
                 log.info("連続成長サイクル完了")
