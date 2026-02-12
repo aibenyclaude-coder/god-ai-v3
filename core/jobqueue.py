@@ -195,6 +195,9 @@ def get_queued_job_summaries() -> list[dict]:
     for j in jobs:
         if j["status"] in ("queued", "running"):
             summaries.append({
+                "task_id": j.get("task_id", "N/A"),
+                "created_at": j.get("meta", {}).get("created_at", ""),
+                "priority": j.get("priority", "P3"),
                 "target_file": j.get("input", {}).get("target_file", ""),
                 "instruction": j.get("input", {}).get("instruction", "")[:100],
                 "status": j["status"],
