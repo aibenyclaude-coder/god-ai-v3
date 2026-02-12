@@ -58,7 +58,23 @@ def _get_cli_env() -> dict:
         if p not in current_path:
             current_path = f"{p}:{current_path}"
     env["PATH"] = current_path
-    env["HOME"] = "/Users/beny"
+
+    # Get HOME from environment, default if not set
+    home_dir = os.environ.get("HOME")
+    if home_dir:
+        env["HOME"] = home_dir
+    else:
+        # Fallback to a safe default if HOME is not set
+        env["HOME"] = "/Users/default_user"
+        log.warning("HOME environment variable not set, using default: /Users/default_user")
+
+    # Add AI status information if relevant
+    if is_ai_paused():
+        remaining = get_ai_pause_remaining()
+        env["AI_STATUS"] = f"PAUSED_UNTIL_{remaining}"
+    else:
+        env["AI_STATUS"] = "RUNNING"
+
     return env
 
 CLI_ENV = _get_cli_env()
