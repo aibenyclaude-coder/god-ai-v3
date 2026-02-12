@@ -326,85 +326,34 @@ async def tweet_scheduler_loop(client):
     Args:
         client: httpx.AsyncClient (for Telegram sending)
     """
-    log.info(f"tweet_scheduler_loop started (interval: {TWEET_INTERVAL} seconds)")
+    log.info("tweet_scheduler_loop started (interval: %d seconds)", TWEET_INTERVAL)
 
-    # Attempt an immediate tweet post if there are no tweets in the history upon startup.
-    # This ensures a tweet is posted if the system starts and the queue is empty.
-    # Also, checks for duplicate tweets before attempting to post.
+    # Attempt an immediate tweet if no history exists upon startup
     if not get_tweet_history():
         log.info("tweet_scheduler_loop: No existing tweet history, attempting immediate tweet.")
-        # Generate tweet first to check for duplicates against potentially empty history
-        tweet_text_to_post = await generate_tweet(client)
-        if tweet_text_to_post and tweet_text_to_post.strip():
-            if tweet_text_to_post not in get_tweet_history(): # Double-check for duplicates
-                result = post_tweet(tweet_text_to_post)
-                if result["success"]:
-                    log.info(f"tweet_scheduler_loop: Initial tweet posted successfully {result['url']}")
-                    try:
-                        # Assuming tg_send is available and works like documented in god.py
-                        # Need to import tg_send or ensure it's accessible.
-                        # from god import tg_send # This import might be needed if not globally available.
-                        # For now, assuming it's accessible in the context of god.py's event loop.
-                        await tg_send(client, f"[Auto-tweet Posted]\n{tweet_text_to_post}\n{result['url']}")
-                        conversations = load_conversations()
-                        conversations.append({
-                            "time": datetime.now(timezone.utc).isoformat(),
-                            "from": "system",
-                            "text": f"Auto-tweet: {tweet_text_to_post[:100]}"
-                        })
-                        save_conversations(conversations)
-                    except Exception as e:
-                        log.warning(f"tweet_scheduler_loop: Failed to send Telegram message or save conversation history: {e}")
-                else:
-                    log.error(f"tweet_scheduler_loop: Initial tweet posting failed {result['error']}")
+        try:
+            success = await auto_tweet(client)
+            if success:
+                log.info("tweet_scheduler_loop: Initial tweet posted successfully via auto_tweet.")
             else:
-                log.warning("tweet_scheduler_loop: Generated initial tweet is a duplicate, skipping.")
-        else:
-            log.warning("tweet_scheduler_loop: Failed to generate initial tweet, skipping.")
+                log.warning("tweet_scheduler_loop: Initial tweet attempt failed or was skipped.")
+        except Exception as e:
+            log.error("tweet_scheduler_loop: Error during initial tweet: %s", e, exc_info=True)
     else:
         log.info("tweet_scheduler_loop: Existing tweet history found, proceeding with normal schedule.")
 
     # Periodic posting loop
     while True:
-        log.info(f"tweet_scheduler_loop: Sleeping for {TWEET_INTERVAL} seconds until next tweet.")
+        log.info("tweet_scheduler_loop: Sleeping for %d seconds until next tweet.", TWEET_INTERVAL)
         await asyncio.sleep(TWEET_INTERVAL)
         try:
-            # Generate tweet and check for duplicates before posting
-            tweet_text = await generate_tweet(client)
-            if not tweet_text or not tweet_text.strip():
-                log.warning("tweet_scheduler_loop: tweet generation failed, skipping.")
-                continue
-
-            tweet_history = get_tweet_history()
-            if tweet_text in tweet_history:
-                log.warning("tweet_scheduler_loop: Generated tweet is a duplicate, skipping.")
-                continue
-
-            result = post_tweet(tweet_text)
-            if result["success"]:
-                log.info(f"tweet_scheduler_loop: Tweet posted successfully {result['url']}")
-                # Assuming tg_send is available and works like documented in god.py
-                # Need to import tg_send or ensure it's accessible.
-                # from god import tg_send # This import might be needed if not globally available.
-                # For now, assuming it's accessible in the context of god.py's event loop.
-                await tg_send(client, f"[Auto-tweet Posted]\n{tweet_text}\n{result['url']}")
-                try:
-                    # Assuming load_conversations and save_conversations are available
-                    # from memory.py and are imported or accessible.
-                    # from memory import load_conversations, save_conversations # This import might be needed.
-                    conversations = load_conversations()
-                    conversations.append({
-                        "time": datetime.now(timezone.utc).isoformat(),
-                        "from": "system",
-                        "text": f"Auto-tweet: {tweet_text[:100]}"
-                    })
-                    save_conversations(conversations)
-                except Exception as e:
-                    log.warning(f"tweet_scheduler_loop: Failed to save conversation history: {e}")
+            success = await auto_tweet(client)
+            if success:
+                log.info("tweet_scheduler_loop: Scheduled tweet posted successfully.")
             else:
-                log.error(f"tweet_scheduler_loop: Tweet posting failed {result['error']}")
+                log.warning("tweet_scheduler_loop: Scheduled tweet attempt failed or was skipped.")
         except Exception as e:
-            log.error(f"tweet_scheduler_loop: An error occurred: {e}", exc_info=True)
+            log.error("tweet_scheduler_loop: An error occurred: %s", e, exc_info=True)
 
 
 def get_setup_instructions() -> str:
