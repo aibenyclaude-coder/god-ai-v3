@@ -374,13 +374,14 @@ async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
                 return await think_claude(prompt)
             except ClaudeSessionExpired:
                 log.warning("Claude CLI session expired, falling back to Gemini.")
+                # If Claude session expired, fallback to Gemini immediately.
                 return await think_gemini(prompt)
             except Exception as e:
                 # Catch any other exceptions from think_claude and fallback to Gemini.
                 log.error(f"Error in think_claude during heavy task: {e}. Falling back to Gemini.", exc_info=True)
                 return await think_gemini(prompt)
         else:
-            # For non-heavy tasks, prioritize Gemini, then GLM-4.
+            # For non-heavy tasks, prioritize Gemini, then GLM-4, then Claude CLI.
             try:
                 return await think_gemini(prompt)
             except Exception as e:
@@ -396,10 +397,10 @@ async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
                         text, brain = await think_claude(prompt)
                         return (text, f"{brain} (fallback)")
                     except ClaudeSessionExpired:
-                        log.error("Claude CLI session expired during fallback.")
+                        log.error("Claude CLI session expired during fallback for non-heavy task.")
                         raise AIUnavailable("AI is unavailable. All models failed, Claude CLI session expired.") from glm_error
                     except Exception as claude_error:
-                        log.error(f"Claude CLI failed during fallback: {claude_error}", exc_info=True)
+                        log.error(f"Claude CLI failed during fallback for non-heavy task: {claude_error}", exc_info=True)
                         raise AIUnavailable(f"AI is unavailable. All models failed, including Claude CLI fallback.") from claude_error
 
     except AIUnavailable as e:
