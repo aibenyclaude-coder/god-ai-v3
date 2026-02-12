@@ -169,46 +169,82 @@ def save_state(state: dict):
 
 async def safe_save_state(state: dict):
     """
-    Safely saves the AI's state to the specified state file path,
-    using a lock to prevent concurrent writes.
-    Validates for full-width characters that could break JSON/Python syntax.
+    Safely saves the AI's state with retry logic, atomic writes,
+    and backup creation to prevent data corruption or loss.
+    Uses a lock to prevent concurrent writes, writes to a temp file
+    first then atomically renames to prevent partial writes, and
+    retries with exponential backoff on disk I/O errors.
     """
-    async with get_write_lock():
-        try:
-            # Convert state to JSON string first, ensuring non-ASCII characters are preserved
-            state_str = json.dumps(state, ensure_ascii=False, indent=2)
-            
-            # Define problematic characters and their replacements.
-            # This dictionary can be expanded to cover a wider range of characters if issues arise.
-            # For now, focusing on commonly problematic full-width characters.
-            replacements = {
-                '【': '[',  # Replace opening full-width bracket with ASCII equivalent
-                '】': ']',  # Replace closing full-width bracket with ASCII equivalent
-                '！': '!',  # Replace full-width exclamation mark
-                '？': '?',  # Replace full-width question mark
-                '：': ':',  # Replace full-width colon
-                '；': ';',  # Replace full-width semicolon
-                '，': ',',  # Replace full-width comma
-                '．': '.',  # Replace full-width period
-                '（': '(',  # Replace full-width parenthesis open
-                '）': ')',  # Replace full-width parenthesis close
-                '｛': '{',  # Replace full-width brace open
-                '｝': '}',  # Replace full-width brace close
-                '「': '"',  # Replace full-width quote open
-                '」': '"',  # Replace full-width quote close
-                '‘': "'",  # Replace full-width apostrophe open
-                '’': "'",  # Replace full-width apostrophe close
-                '…': '...', # Replace full-width ellipsis
-            }
-            
-            # Apply replacements to the JSON string
-            for char, replacement in replacements.items():
-                state_str = state_str.replace(char, replacement)
+    max_retries = 3
+    retry_delay = 0.5
 
-            # Write the cleaned string to the state file
-            STATE_PATH.write_text(state_str, encoding="utf-8")
-        except Exception as e:
-            log.error(f"Failed to save state to {STATE_PATH}: {e}")
+    async with get_write_lock():
+        for attempt in range(max_retries):
+            try:
+                # Create a .bak backup of the current state file before overwriting
+                if STATE_PATH.exists():
+                    backup_path = STATE_PATH.parent / (STATE_PATH.name + ".bak")
+                    try:
+                        backup_path.write_text(
+                            STATE_PATH.read_text(encoding="utf-8"),
+                            encoding="utf-8"
+                        )
+                    except Exception as bak_err:
+                        log.warning(f"Failed to create .bak backup before save: {bak_err}")
+
+                # Delegate JSON serialization and sanitization to save_state-compatible logic
+                state_str = json.dumps(state, ensure_ascii=False, indent=2)
+
+                replacements = {
+                    '\u3010': '[', '\u3011': ']',
+                    '\uff01': '!', '\uff1f': '?',
+                    '\uff1a': ':', '\uff1b': ';',
+                    '\uff0c': ',', '\uff0e': '.',
+                    '\uff08': '(', '\uff09': ')',
+                    '\uff5b': '{', '\uff5d': '}',
+                    '\u300c': '"', '\u300d': '"',
+                    '\u2018': "'", '\u2019': "'",
+                    '\u2026': '...',
+                }
+                for char, replacement in replacements.items():
+                    state_str = state_str.replace(char, replacement)
+
+                # Write to a temporary file in the same directory, then atomically rename
+                dir_path = STATE_PATH.parent
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=str(dir_path), suffix=".tmp", prefix="state_"
+                )
+                try:
+                    os.write(fd, state_str.encode("utf-8"))
+                    os.fsync(fd)
+                    os.close(fd)
+                    fd = -1
+                    os.replace(tmp_path, str(STATE_PATH))
+                except BaseException:
+                    if fd >= 0:
+                        os.close(fd)
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                    raise
+
+                # Success - exit retry loop
+                return
+
+            except OSError as e:
+                log.error(
+                    f"Disk I/O error saving state (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    log.error(
+                        "All retries exhausted for safe_save_state. State may not be saved."
+                    )
+
+            except Exception as e:
+                log.error(f"Failed to save state to {STATE_PATH}: {e}")
+                return
 
 async def safe_save_state(state: dict):
     async with get_write_lock():
