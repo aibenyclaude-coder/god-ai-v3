@@ -34,7 +34,7 @@ from memory import (
     safe_save_state, safe_append_journal
 )
 from brain import think_gemini, think_claude
-from jobqueue import create_job, is_p1_interrupted, clear_p1_interrupt, get_queued_job_summaries, get_recent_failed_jobs
+from jobqueue import create_job, is_p1_interrupted, clear_p1_interrupt, get_queued_job_summaries, get_recent_failed_jobs, load_queue
 
 # --- CLAUDE.md パス ---
 CLAUDE_MD_PATH = BASE_DIR / "CLAUDE.md"
@@ -267,24 +267,62 @@ def get_stats_summary() -> str:
 
 
 def should_skip_improvement(improvement_text: str, module: str) -> tuple[bool, str]:
-    """統計に基づいて改善をスキップすべきか判定
+    """Decide whether to skip an improvement based on growth stats.
+
+    Improvements over the original logic:
+    - Raise the same-reason failure threshold from 3 to 5 to avoid
+      blocking all improvements too aggressively.
+    - Reset failure counts if the last success was more than 2 hours ago,
+      so the system gets another chance after a cooldown period.
+    - Raise the per-module consecutive failure threshold from 3 to 4.
+    - Only count per-module failures for the *same* module as the
+      proposed improvement (skip unrelated module failures).
 
     Args:
-        improvement_text: 改善内容のテキスト
-        module: 対象モジュール名
+        improvement_text: The improvement proposal text.
+        module: Target module name.
 
     Returns:
-        (スキップすべきか, 理由)
+        (should_skip, reason)
     """
     stats = load_growth_stats()
 
-    # 直近10回の結果から同じ失敗パターンをチェック
     recent = stats["last_10_results"]
+    if not recent:
+        return (False, "")
 
-    # 同じ原因で3回以上失敗しているかチェック
+    # Check if enough time has passed since the last success.
+    # If more than 2 hours have elapsed, reset failure tracking
+    # to give improvements another chance.
+    last_success_time = None
+    for result in reversed(recent):
+        if result.get("success"):
+            try:
+                last_success_time = datetime.fromisoformat(result["time"])
+            except (ValueError, KeyError):
+                pass
+            break
+
+    hours_since_success = None
+    if last_success_time:
+        now = datetime.now()
+        # Handle timezone-naive comparison
+        if last_success_time.tzinfo is not None:
+            now = datetime.now(timezone.utc)
+        hours_since_success = (now - last_success_time).total_seconds() / 3600
+
+    # If more than 2 hours since last success, allow improvements again
+    if hours_since_success is not None and hours_since_success >= 2.0:
+        log.info(
+            f"should_skip_improvement: {hours_since_success:.1f}h since last success, "
+            f"resetting failure tracking"
+        )
+        return (False, "")
+
+    # Count failures by reason in last 10 results
     failure_counts = {}
     for result in recent:
-        if not result["success"] and result["failure_reason"]:
+        if not result["success"] and result.get("failure_reason"):
             reason = result["failure_reason"]
             failure_counts[reason] = failure_counts.get(reason, 0) + 1
 
@@ -296,18 +334,20 @@ def should_skip_improvement(improvement_text: str, module: str) -> tuple[bool, s
         "rollback": "ロールバック"
     }
 
+    # Threshold raised from 3 to 5 to avoid blocking improvements too early
     for reason, count in failure_counts.items():
-        if count >= 3:
+        if count >= 5:
             reason_jp = reason_names.get(reason, reason)
             return (True, f"同じ原因({reason_jp})で{count}回失敗しています")
 
-    # 特定モジュールで連続失敗しているかチェック
+    # Check per-module consecutive failures (only for the target module)
+    # Threshold raised from 3 to 4
     module_failure_count = 0
-    for result in recent[-5:]:  # 直近5回をチェック
+    for result in recent[-5:]:
         if not result["success"] and result.get("module") == module:
             module_failure_count += 1
 
-    if module_failure_count >= 3:
+    if module_failure_count >= 4:
         return (True, f"モジュール({module})で直近{module_failure_count}回連続失敗中")
 
     return (False, "")
@@ -1430,71 +1470,86 @@ async def reflection_scheduler(client: httpx.AsyncClient):
             await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} 定期振り返りエラー\n{e}")
             await asyncio.sleep(10)
 
-# --- 自己成長スケジューラ（連続実行版） ---
-async def self_growth_scheduler(client: httpx.AsyncClient):
-    """連続自己成長: 振り返り→改善ジョブ生成→キュー登録→完了→次
+# --- 自己成長スケジューラ（3フェーズ版） ---
+async def _wait_for_pending_improvements(timeout: int = 600):
+    """Wait for all queued/running self_improve jobs to complete.
 
-    30分間隔を廃止。完了したら即座に次のサイクル。
-    sleep(10)だけ挟んでAPI負荷を軽減。
+    Args:
+        timeout: Maximum wait time in seconds (default 10 minutes).
+    """
+    start = time_module.time()
+    while time_module.time() - start < timeout:
+        jobs = load_queue()
+        pending = [
+            j for j in jobs
+            if j["type"] == "self_improve"
+            and j["status"] in ("queued", "running")
+        ]
+        if not pending:
+            log.info("All self_improve jobs completed")
+            return
+
+        log.debug(f"Waiting for {len(pending)} self_improve jobs...")
+        await asyncio.sleep(5)
+
+    log.warning(f"Timed out waiting for self_improve jobs after {timeout}s")
+
+
+async def self_growth_scheduler(client: httpx.AsyncClient):
+    """3-phase self-growth: research -> analyze_plan -> wait for self_improve.
+
+    Phase 1 (Research): Pure Python code analysis, no AI.
+                        Scans all modules, extracts structure, saves report.
+    Phase 2 (Analyze):  Gemini analyzes report, creates self_improve jobs.
+    Phase 3 (Wait):     job_worker_loop executes self_improve jobs.
+                        This scheduler waits for completion.
     """
     from config import GROWTH_CYCLE_SLEEP
-    log.info(f"連続自己成長スケジューラ開始 (サイクル間隔: {GROWTH_CYCLE_SLEEP}秒)")
-    await asyncio.sleep(30)  # 起動後30秒待ってから開始
+    from job_worker import _execute_research, _execute_analyze_plan
 
-    # 実行しようとする関数名のリスト（reflection_cycle, create_job, select_target_moduleなど）
-    # これらの関数が growth.py 内に存在することを保証する
-    # 実際には、importlib.util.find_spec または globals() を使って動的にチェックするのがより堅牢
-    # ここでは、既知の関数名をリストアップして、存在しない場合のエラーを検出する
-    # 以下のリストは、self_growth_scheduler が直接・間接的に呼び出す可能性のある関数
-    known_growth_functions = [
-        "reflection_cycle",
-        "create_job",
-        "select_target_module",
-        "record_improvement",
-        "is_duplicate_improvement",
-        "update_growth_stats",
-        "safe_append_journal",
-        "get_queued_job_summaries",
-        "get_recent_failed_jobs",
-        "think_gemini", # brain.py から呼ばれるが、growth.py からの呼び出しとみなす
-        "load_state", # memory.py から呼ばれるが、growth.py からの呼び出しとみなす
-        "safe_save_state", # memory.py から呼ばれるが、growth.py からの呼び出しとみなす
-        "load_growth_stats",
-        "update_claude_md",
-        "_detect_invalid_module_names",
-        "_detect_read_files",
-    ]
+    log.info(f"3-phase self-growth scheduler started (interval: {GROWTH_CYCLE_SLEEP}s)")
+    await asyncio.sleep(30)  # Wait 30s after startup
 
     while True:
         try:
-            # P1割り込みチェック
+            # P1 interrupt check
             if is_p1_interrupted():
-                log.info("連続成長: P1割り込みにより一時待機")
+                log.info("self_growth: P1 interrupt, waiting")
                 clear_p1_interrupt()
                 await asyncio.sleep(GROWTH_CYCLE_SLEEP)
                 continue
 
-            # 振り返り実行（結果からCODE_IMPROVEMENTを検出→ジョブ作成は_reflection_cycle_inner内）
-            # reflection_cycle 関数が存在するかチェック
-            if "reflection_cycle" not in globals() or not callable(reflection_cycle):
-                error_msg = "reflection_cycle 関数が見つかりません。growth.py のロードに失敗した可能性があります。"
-                log.error(error_msg)
-                await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} 緊急エラー\n{error_msg}")
-                await asyncio.sleep(GROWTH_CYCLE_SLEEP * 2) # 長めに待機
+            # === Phase 1: Research (no AI, pure code analysis) ===
+            log.info("=== Growth Phase 1: Research ===")
+            report = _execute_research()
+
+            if not report or not report.get("modules"):
+                log.warning("Research phase produced empty report, skipping cycle")
+                await asyncio.sleep(GROWTH_CYCLE_SLEEP)
                 continue
 
-            executed, result = await reflection_cycle(client)
-            if executed:
-                log.info("連続成長サイクル完了")
-            else:
-                log.info("連続成長: 振り返りスキップ")
+            # === Phase 2: Analyze + Plan (Gemini -> create self_improve jobs) ===
+            log.info("=== Growth Phase 2: Analyze + Plan ===")
+            await _execute_analyze_plan(client, report)
 
-            # 短い待機のみ
+            # === Phase 3: Wait for self_improve jobs to complete ===
+            log.info("=== Growth Phase 3: Waiting for improvements ===")
+            await _wait_for_pending_improvements()
+
+            # Update CLAUDE.md and state
+            update_claude_md()
+            state = load_state()
+            state["growth_cycles"] = state.get("growth_cycles", 0) + 1
+            state["last_reflection"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            await safe_save_state(state)
+
             await asyncio.sleep(GROWTH_CYCLE_SLEEP)
         except asyncio.CancelledError:
-            log.info("連続自己成長スケジューラ: キャンセルされました")
+            log.info("self_growth_scheduler: Cancelled")
             raise
         except Exception as e:
-            log.error(f"連続自己成長スケジューラエラー: {e}", exc_info=True)
-            await safe_append_journal(f"### {datetime.now().strftime('%H:%M')} 連続成長エラー\n{e}")
+            log.error(f"self_growth_scheduler error: {e}", exc_info=True)
+            await safe_append_journal(
+                f"### {datetime.now().strftime('%H:%M')} Growth cycle error\n{e}"
+            )
             await asyncio.sleep(GROWTH_CYCLE_SLEEP)
