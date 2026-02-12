@@ -358,40 +358,65 @@ def update_job(task_id: str, **updates) -> dict | None:
 
 
 def get_next_queued_job() -> dict | None:
-    """優先度が最も高い(P1>P2>P3)、statusがqueuedのジョブを取得。
-    depends_onが未完了のジョブはスキップ。
-    同一target_fileでrunning中のジョブがあるものもスキップ（ファイルロック）。
     """
-    jobs = load_queue()
-    queued = [j for j in jobs if j["status"] == "queued"]
-    if not queued:
+    Retrieves the highest priority job from the queue that is in 'queued' status.
+    It skips jobs that have unmet dependencies or are for a target file currently
+    being processed by another 'running' job.
+    Includes error handling for robust queue processing.
+    """
+    try:
+        jobs = load_queue()
+    except Exception as e:
+        log.error(f"Failed to load job queue: {e}", exc_info=True)
         return None
 
-    # 依存チェック: depends_onの全ジョブがsuccess/cancelledであること
-    completed_ids = {j["task_id"] for j in jobs if j["status"] in ("success", "cancelled")}
+    queued_jobs = [j for j in jobs if j.get("status") == "queued"]
+    if not queued_jobs:
+        return None
+
+    # Prepare sets for dependency and file lock checks
+    completed_ids = {
+        j["task_id"]
+        for j in jobs
+        if j.get("status") in ("success", "cancelled")
+    }
     running_targets = {
         j["input"]["target_file"]
         for j in jobs
-        if j["status"] == "running" and j["input"].get("target_file")
+        if j.get("status") == "running" and j.get("input", {}).get("target_file")
     }
 
-    eligible = []
-    for job in queued:
-        deps = job["meta"].get("depends_on", [])
-        if deps and not all(d in completed_ids for d in deps):
+    eligible_jobs = []
+    for job in queued_jobs:
+        # Dependency Check: Ensure all dependencies are met
+        dependencies = job.get("meta", {}).get("depends_on", [])
+        if dependencies and not all(dep_id in completed_ids for dep_id in dependencies):
             continue
-        # ファイルロック: running中のジョブと同じtarget_fileは待機
-        tf = job["input"].get("target_file", "")
-        if tf and tf in running_targets:
-            continue
-        eligible.append(job)
 
-    if not eligible:
+        # File Lock Check: Avoid processing if the target file is already running
+        target_file = job.get("input", {}).get("target_file", "")
+        if target_file and target_file in running_targets:
+            continue
+
+        eligible_jobs.append(job)
+
+    if not eligible_jobs:
         return None
 
-    # 優先度順ソート (P1=1, P2=2, P3=3)、同優先度ならcreated_at順
-    eligible.sort(key=lambda j: (PRIORITY_ORDER.get(j["priority"], 9), j["meta"]["created_at"]))
-    return eligible[0]
+    # Sort eligible jobs by priority (P1 > P2 > P3) and then by creation time
+    try:
+        eligible_jobs.sort(
+            key=lambda j: (
+                PRIORITY_ORDER.get(j.get("priority", "P3"), 9),
+                j.get("meta", {}).get("created_at", ""),
+            )
+        )
+    except Exception as e:
+        log.error(f"Error sorting eligible jobs: {e}", exc_info=True)
+        return None
+
+    # Return the highest priority job
+    return eligible_jobs[0]
 
 
 def is_file_locked(target_file: str) -> bool:
