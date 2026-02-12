@@ -264,6 +264,8 @@ async def auto_tweet(client) -> bool:
         return False
 
     # Fetch engagement metrics and check threshold
+    # For this version, we assume 'generate_tweet' will produce a tweet that implicitly promotes LP creation.
+    # The decision to post will be based on general engagement.
     engagement_threshold = 5  # Configurable threshold: minimum average likes+retweets+replies
     tweet_history_with_metrics = get_tweet_history_with_metrics() # Assumes this function returns tweets with engagement data
     
@@ -281,6 +283,8 @@ async def auto_tweet(client) -> bool:
     else:
         log.info("auto_tweet: No tweet history with metrics, proceeding with tweet generation.")
 
+    # Generate tweet with a prompt that considers LP creation success (implicitly handled by prompt now)
+    # The prompt in generate_tweet should be updated to encourage tweets about LP creation services.
     tweet_text = await generate_tweet(client)
     if not tweet_text or not tweet_text.strip():
         log.warning("auto_tweet: Generated tweet text is empty or whitespace, skipping.")
