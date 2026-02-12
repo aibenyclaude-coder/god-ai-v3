@@ -355,8 +355,13 @@ async def think_claude(prompt: str, timeout: int = 120) -> tuple[str, str]:
     raise AIUnavailable(f"Claude CLI failed after 3 attempts (timeouts={timeouts}s).")
 
 # --- 統合思考関数 ---
-async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
+async def think(prompt: str, heavy: bool = False, bias_to_x_lp: bool = False) -> tuple[str, str]:
     """Unified thinking function. Returns: (text, brain_name)
+
+    Args:
+        prompt (str): The input prompt for the AI model.
+        heavy (bool, optional): If True, prioritizes Claude CLI for longer tasks. Defaults to False.
+        bias_to_x_lp (bool, optional): If True, biases the prompt towards X posts and LP proposals. Defaults to False.
 
     Raises:
         AIUnavailable: If the AI is paused or if all underlying AI models fail.
@@ -366,6 +371,16 @@ async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
         remaining = get_ai_pause_remaining()
         raise AIUnavailable(f"AI is currently paused (remaining {remaining} seconds).")
 
+    # Prepend instruction if bias_to_x_lp is True
+    if bias_to_x_lp:
+        x_lp_instruction = (
+            "[PRIORITY] Focus on generating content specifically for X (formerly Twitter) posts and "
+            "Landing Page (LP) proposals. Prioritize conciseness, engagement, and conversion-oriented "
+            "language suitable for these platforms. Ensure output is ready for immediate use.\n\n"
+        )
+        prompt = x_lp_instruction + prompt
+        log.info("bias_to_x_lp is True, prepended specific instruction to prompt.")
+
     # Check if current goal is revenue generation and prepend LP priority instruction
     try:
         from config import GOALS_PATH
@@ -374,7 +389,7 @@ async def think(prompt: str, heavy: bool = False) -> tuple[str, str]:
             # Detect revenue-focused phase from goals
             revenue_keywords = ["LP", "coconala", "revenue", "earning", "income"]
             is_revenue_phase = any(kw.lower() in goals_text.lower() for kw in revenue_keywords)
-            if is_revenue_phase:
+            if is_revenue_phase and not bias_to_x_lp: # Avoid double-prepending if bias_to_x_lp is already set
                 state = load_state()
                 current_task = state.get("current_task")
                 # Only prepend LP instruction when no specific task is set
