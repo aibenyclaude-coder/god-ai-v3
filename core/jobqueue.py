@@ -82,12 +82,19 @@ def is_p1_interrupted() -> bool:
 
 # --- ファイルベース永続化 ---
 def load_queue() -> list[dict]:
-    """job_queue.json からジョブ一覧を読み込む。
-    整合性チェックを強化し、不正なエントリはログに記録して除外する。
-    `init_job_queue` が呼ばれる前に `_p1_interrupt_event` が None であっても
-    NameError を捕捉して処理を継続できるようにする。
+    """Job queue file loading with enhanced validation and error handling.
+
+    This function loads job data from the JOB_QUEUE_PATH. It includes
+    robust validation to ensure the data is in the expected format and
+    contains all necessary keys for each job entry. Invalid entries are
+    logged and excluded.
+
+    It also handles potential `NameError` if `_p1_interrupt_event` is
+    accessed before `init_job_queue` has been called, initializing it
+    if necessary.
     """
     global _p1_interrupt_event
+    # Ensure P1 interrupt event is initialized if not already
     if _p1_interrupt_event is None:
         log.warning("P1 interrupt event not initialized. Initializing now.")
         _p1_interrupt_event = asyncio.Event()
@@ -105,7 +112,7 @@ def load_queue() -> list[dict]:
                     log.warning(f"Job queue entry {i} has invalid type: {job}")
                     continue
 
-                # Check for required keys
+                # Check for required top-level keys
                 required_keys = ["task_id", "type", "priority", "status", "input", "output", "meta"]
                 if not all(key in job for key in required_keys):
                     log.warning(f"Job queue entry {i} is missing required keys: {job.get('task_id', 'N/A')}")
@@ -113,31 +120,39 @@ def load_queue() -> list[dict]:
 
                 # Check for required keys within input
                 input_job = job.get("input", {})
-                if not all(key in input_job for key in ["target_file", "read_files", "instruction", "constraints"]):
+                required_input_keys = ["target_file", "read_files", "instruction", "constraints"]
+                if not all(key in input_job for key in required_input_keys):
                     log.warning(f"Job queue entry {i}'s input is missing required keys: {job.get('task_id', 'N/A')}")
                     continue
 
                 # Check for required keys within meta
                 meta_job = job.get("meta", {})
-                if not all(key in meta_job for key in ["created_at", "estimated_seconds", "retry_count", "max_retries", "error_history"]):
+                required_meta_keys = ["created_at", "estimated_seconds", "retry_count", "max_retries", "error_history"]
+                if not all(key in meta_job for key in required_meta_keys):
                     log.warning(f"Job queue entry {i}'s meta is missing required keys: {job.get('task_id', 'N/A')}")
                     continue
 
-                # Type checking (partial)
-                if not isinstance(job["task_id"], str) or not isinstance(job["type"], str) or not isinstance(job["priority"], str) or not isinstance(job["status"], str):
+                # Basic type checking for critical fields
+                if not isinstance(job.get("task_id"), str) or \
+                   not isinstance(job.get("type"), str) or \
+                   not isinstance(job.get("priority"), str) or \
+                   not isinstance(job.get("status"), str):
                     log.warning(f"Job queue entry {i}'s required string fields have invalid types: {job.get('task_id', 'N/A')}")
                     continue
-                if not isinstance(job["input"].get("read_files"), list) or not isinstance(job["input"].get("instruction"), str) or not isinstance(job["input"].get("constraints"), list):
+                if not isinstance(input_job.get("read_files"), list) or \
+                   not isinstance(input_job.get("instruction"), str) or \
+                   not isinstance(input_job.get("constraints"), list):
                     log.warning(f"Job queue entry {i}'s input fields have invalid types: {job.get('task_id', 'N/A')}")
                     continue
-                if not isinstance(job["meta"].get("error_history"), list):
+                if not isinstance(meta_job.get("error_history"), list):
                     log.warning(f"Job queue entry {i}'s meta.error_history has invalid type: {job.get('task_id', 'N/A')}")
                     continue
 
                 valid_jobs.append(job)
 
+            # If some jobs were invalid, resave the queue with only valid jobs
             if len(valid_jobs) < len(data):
-                # Resave with formatting to remove invalid entries
+                log.warning(f"Invalid job entries found and removed. Resaving queue.")
                 save_queue(valid_jobs)
 
             return valid_jobs
@@ -145,8 +160,10 @@ def load_queue() -> list[dict]:
         except json.JSONDecodeError as e:
             log.warning(f"Failed to decode job queue JSON: {e} in {JOB_QUEUE_PATH}")
         except FileNotFoundError:
-            pass  # Return empty list if file doesn't exist
+            # File not existing is not an error, just means an empty queue
+            pass
         except Exception as e:
+            # Catch any other unexpected errors during loading
             log.error(f"Unexpected error loading job queue: {e}", exc_info=True)
 
     return []
@@ -370,7 +387,10 @@ def get_next_queued_job() -> dict | None:
     It skips jobs that have unmet dependencies or are for a target file currently
     being processed by another 'running' job.
     Includes error handling for robust queue processing.
+    If a job has been queued for an excessive amount of time, it is flagged.
     """
+    LONG_QUEUE_THRESHOLD_SECONDS = 7200  # 2 hours
+
     try:
         jobs = load_queue()
     except Exception as e:
@@ -394,6 +414,8 @@ def get_next_queued_job() -> dict | None:
     }
 
     eligible_jobs = []
+    now = datetime.now(timezone.utc)
+
     for job in queued_jobs:
         # Dependency Check: Ensure all dependencies are met
         dependencies = job.get("meta", {}).get("depends_on", [])
@@ -404,6 +426,21 @@ def get_next_queued_job() -> dict | None:
         target_file = job.get("input", {}).get("target_file", "")
         if target_file and target_file in running_targets:
             continue
+
+        # Long Queue Check: Flag jobs that have been queued for too long
+        if job.get("meta", {}).get("created_at"):
+            try:
+                created_at = datetime.fromisoformat(job["meta"]["created_at"])
+                queue_duration = (now - created_at).total_seconds()
+                if queue_duration > LONG_QUEUE_THRESHOLD_SECONDS:
+                    log.warning(
+                        f"Job {job.get('task_id', 'N/A')} has been queued for "
+                        f"{queue_duration:.0f} seconds, exceeding the threshold."
+                    )
+                    # Optionally, you could modify the job status here or add a flag
+                    # For now, we just log it and proceed to return it if it's the highest priority.
+            except Exception as e:
+                log.error(f"Error calculating queue duration for job {job.get('task_id', 'N/A')}: {e}")
 
         eligible_jobs.append(job)
 
