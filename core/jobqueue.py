@@ -146,15 +146,28 @@ def load_queue() -> list[dict]:
 
 
 def save_queue(jobs: list[dict]):
-    """job_queue.json にジョブ一覧を保存（最新200件）"""
+    """save_queue.py にジョブ一覧を保存（最新200件）
+    atomic writeを実装し、書き込み中のプロセス中断によるデータ破損を防ぐ。
+    """
     if len(jobs) > 200:
         jobs = jobs[-200:]
+
+    temp_path = JOB_QUEUE_PATH.with_suffix(".json.tmp")
     try:
-        JOB_QUEUE_PATH.write_text(
+        # 一時ファイルに書き込む
+        temp_path.write_text(
             json.dumps(jobs, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        # 既存ファイルを置き換える（アトミック操作）
+        temp_path.replace(JOB_QUEUE_PATH)
     except Exception as e:
         log.error(f"ジョブキュー保存失敗: {e}")
+        # 一時ファイルが残っていたら削除
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception as rm_e:
+                log.error(f"一時ジョブキューファイルの削除失敗: {rm_e}")
 
 
 # --- CRUD操作 ---
