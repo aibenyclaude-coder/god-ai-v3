@@ -127,7 +127,9 @@ async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
     """
     global _gemini_count
     max_retries = 3
-    retry_delay = 8
+    initial_retry_delay = 8  # Initial delay in seconds
+    max_retry_delay = 60  # Maximum delay in seconds
+    retry_delay = initial_retry_delay
 
     # Context window management: Limit prompt length to avoid exceeding model limits
     # and to prioritize recent information. A reasonable limit could be around 16000 tokens
@@ -154,25 +156,9 @@ async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
                     },
                     timeout=60,
                 )
+                resp.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+
                 data = resp.json()
-
-                # 429 Rate Limit チェック
-                if resp.status_code == 429:
-                    log.warning(f"Gemini 429 rate limit, attempt {attempt+1}/{max_retries}, waiting {retry_delay}s...")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    else:
-                        raise Exception("Gemini 429 rate limit exceeded after retries")
-
-                if "error" in data:
-                    # Gemini APIエラーの詳細をログに残す
-                    error_message = data["error"].get("message", "Unknown error")
-                    error_details = data["error"].get("details", [])
-                    log.error(f"Gemini API error (attempt {attempt+1}): {error_message} - Details: {error_details}")
-                    # エラー内容によってはフォールバックを検討（例: invalid-argumentなど）
-                    # ここでは一旦、一般的なエラーとして後続のフォールバックに任せる
-                    raise Exception(f"Gemini API error: {error_message}")
 
                 if "candidates" not in data or not data["candidates"]:
                     log.error(f"Gemini API invalid response (attempt {attempt+1}): No candidates found. Response: {data}")
@@ -181,27 +167,55 @@ async def think_gemini(prompt: str, max_tokens: int = 4096) -> tuple[str, str]:
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 _gemini_count += 1
                 await _save_brain_counts(_gemini_count, _glm_count, _claude_count)
+                # Reset retry delay on success
+                retry_delay = initial_retry_delay
                 return (text, f"Gemini {GEMINI_MODEL}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                log.warning(f"Gemini 429 rate limit, attempt {attempt+1}/{max_retries}, waiting {retry_delay}s...")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    # Exponential backoff
+                    retry_delay = min(retry_delay * 2, max_retry_delay)
+                    continue
+                else:
+                    log.error("Gemini 429 rate limit exceeded after retries.")
+                    raise Exception("Gemini 429 rate limit exceeded after retries") from e
+            else:
+                # Handle other HTTP errors
+                log.error(f"Gemini HTTP error (attempt {attempt+1}): {e.response.status_code} - {e.response.text}", exc_info=True)
+                raise e # Re-raise to be caught by the general exception handler
         except Exception as e:
-            if attempt < max_retries - 1 and "429" in str(e):
-                log.warning(f"Gemini error (attempt {attempt+1}): {e}, retrying in {retry_delay}s...")
+            # Catch any other exceptions (network issues, JSON parsing, etc.)
+            log.error(f"Gemini failed (attempt {attempt+1}): {e}", exc_info=True)
+            if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay)
+                # Exponential backoff
+                retry_delay = min(retry_delay * 2, max_retry_delay)
                 continue
-            # Gemini完全失敗 → GLM-4フォールバック
-            log.error(f"Gemini failed (attempt {attempt+1}): {e}, falling back to GLM-4")
-            try:
-                text, brain = await think_glm(prompt)
-                return (text, f"{brain} (fallback)")
-            except Exception as glm_error:
-                log.error(f"GLM-4 failed: {glm_error}, falling back to Claude CLI")
-                # GLM失敗 → Claude CLIフォールバック
+            else:
+                # Gemini complete failure → GLM-4 fallback
+                log.error("Gemini failed after all retries, falling back to GLM-4.")
                 try:
-                    text, _ = await think_claude(prompt)
-                    return (text, "Claude CLI (fallback)")
-                except ClaudeSessionExpired:
-                    # 全部失敗 → AI一時停止
-                    pause_ai()
-                    raise AIUnavailable("Gemini 429 + GLM失敗 + Claude CLIセッション切れ。会話不可")
+                    text, brain = await think_glm(prompt)
+                    return (text, f"{brain} (fallback)")
+                except Exception as glm_error:
+                    log.error(f"GLM-4 failed: {glm_error}, falling back to Claude CLI")
+                    # GLM failure → Claude CLI fallback
+                    try:
+                        text, _ = await think_claude(prompt)
+                        return (text, "Claude CLI (fallback)")
+                    except ClaudeSessionExpired:
+                        # All failed → AI pause
+                        pause_ai()
+                        raise AIUnavailable("Gemini failed + GLM failed + Claude CLI session expired. Conversation unavailable.")
+                    except Exception as claude_error:
+                        log.error(f"Claude CLI failed during fallback: {claude_error}")
+                        raise AIUnavailable(f"Gemini and GLM failed, Claude CLI also failed: {claude_error}")
+
+    # Should not reach here if max_retries is handled correctly, but as a safeguard:
+    log.error("Unexpected exit from Gemini think loop.")
+    raise AIUnavailable("An unexpected error occurred during Gemini processing.")
 
 # --- GLM-4 API (智谱AI) ---
 GLM_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
