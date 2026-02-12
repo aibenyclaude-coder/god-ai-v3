@@ -189,19 +189,37 @@ def is_duplicate_job(job_type: str, target_file: str, instruction: str) -> bool:
 
 
 def get_queued_job_summaries() -> list[dict]:
-    """キュー内のqueued/runningジョブのサマリーを返す（振り返りプロンプト用）"""
+    """キュー内のqueued/runningジョブのサマリーを返す（振り返りプロンプト用）
+    異常に長時間キューに留まっているジョブを検出・報告する。
+    """
     jobs = load_queue()
     summaries = []
+    now = datetime.now(timezone.utc)
+    long_queue_threshold_seconds = 3600  # 1時間
+
     for j in jobs:
         if j["status"] in ("queued", "running"):
-            summaries.append({
+            summary = {
                 "task_id": j.get("task_id", "N/A"),
                 "created_at": j.get("meta", {}).get("created_at", ""),
                 "priority": j.get("priority", "P3"),
                 "target_file": j.get("input", {}).get("target_file", ""),
                 "instruction": j.get("input", {}).get("instruction", "")[:100],
                 "status": j["status"],
-            })
+            }
+
+            # 長時間キュー滞留チェック
+            if j["status"] == "queued" and j.get("meta", {}).get("created_at"):
+                try:
+                    created_at = datetime.fromisoformat(j["meta"]["created_at"])
+                    queue_duration = (now - created_at).total_seconds()
+                    if queue_duration > long_queue_threshold_seconds:
+                        log.warning(f"Job {j.get('task_id', 'N/A')} has been queued for {queue_duration:.0f} seconds.")
+                        summary["long_queue_warning"] = True
+                except Exception as e:
+                    log.error(f"Error calculating queue duration for job {j.get('task_id', 'N/A')}: {e}")
+
+            summaries.append(summary)
     return summaries
 
 
