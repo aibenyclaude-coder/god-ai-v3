@@ -56,9 +56,11 @@ def load_state() -> dict:
         log.error(f"State file at {STATE_PATH} is corrupted. Attempting recovery.")
         # Attempt to recover by creating a default state and logging the error
         try:
-            # Create a backup of the corrupted file
-            backup_path = MEMORY_DIR / f"state.json.corrupted.{datetime.now(timezone.utc).isoformat().replace(':', '-')}"
-            backup_path.write_text(state_content, encoding="utf-8")
+            # Create a backup of the corrupted file with a timestamp
+            corrupted_state_content = STATE_PATH.read_text(encoding="utf-8")
+            backup_filename = f"state.json.corrupted.{datetime.now(timezone.utc).isoformat().replace(':', '-')}.bak"
+            backup_path = MEMORY_DIR / backup_filename
+            backup_path.write_text(corrupted_state_content, encoding="utf-8")
             log.info(f"Corrupted state file backed up to {backup_path}")
         except Exception as e:
             log.error(f"Failed to create backup of corrupted state file: {e}")
